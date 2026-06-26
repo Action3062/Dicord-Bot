@@ -1,0 +1,11 @@
+node_modules
+.pnpm-store
+.claude
+.agents
+dist
+data
+.env
+.env.local
+coverage
+*.log
+*.pid

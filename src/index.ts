@@ -1,0 +1,2445 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import {
+  ActionRowBuilder,
+  AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ChannelType,
+  Client,
+  EmbedBuilder,
+  Events,
+  GatewayIntentBits,
+  Guild,
+  GuildMember,
+  ModalBuilder,
+  PermissionFlagsBits,
+  REST,
+  Routes,
+  TextChannel,
+  TextInputBuilder,
+  TextInputStyle,
+  type ButtonInteraction,
+  type ChatInputCommandInteraction,
+  type Interaction,
+  type Message,
+  type ModalSubmitInteraction,
+  type User
+} from "discord.js";
+import { ActivityStore, type WarningEntry, type WarningSource } from "./activity-store.js";
+import { commands } from "./commands.js";
+import { config } from "./config.js";
+import { answerQuestion, listFaqTopics, searchFaqItems } from "./faq.js";
+import { FaqStore } from "./faq-store.js";
+import { checkPortalUser, getActiveSessionCount, getJellyfinInfo, getPortalHealth, refreshJellyfinLibrary, searchJellyfinMedia } from "./jellyfin.js";
+import {
+  analyzeTicketInput,
+  generateAssistantReply,
+  generateFaqDraft,
+  generateReplySuggestion,
+  generateTicketSummary,
+  isOpenAiAssistantReady,
+  type AssistantContext,
+  type FaqDraft,
+  type TicketAnalysis,
+  type TicketPriority
+} from "./openai-assistant.js";
+import { flushPendingWrites } from "./persistence.js";
+import { SupportStore, type SupportStatus } from "./support-store.js";
+import { getTicketCategory, inferTicketCategory } from "./ticket-categories.js";
+import { TicketStore, type Ticket } from "./ticket-store.js";
+
+const store = ActivityStore.fromDataDir(config.BOT_DATA_DIR);
+const ticketStore = TicketStore.fromDataDir(config.BOT_DATA_DIR);
+const supportStore = SupportStore.fromDataDir(config.BOT_DATA_DIR);
+const faqStore = FaqStore.fromDataDir(config.BOT_DATA_DIR);
+type RecentUserMessage = {
+  at: number;
+  contentKey: string;
+  linkCount: number;
+  mentionCount: number;
+};
+
+const recentMessages = new Map<string, RecentUserMessage[]>();
+const moderationCooldowns = new Map<string, number>();
+const TICKET_CREATE_BUTTON_ID = "ticket:create";
+const TICKET_CREATE_MODAL_ID = "ticket:create-modal";
+const TICKET_MODAL_SUBJECT_ID = "ticket-subject";
+const TICKET_MODAL_DESCRIPTION_ID = "ticket-description";
+const AI_LIBRARY_SCAN_BUTTON_ID = "ai:jellyfin-library-scan";
+const AI_SUGGEST_SEND_PREFIX = "ai:suggest:send:";
+const AI_SUGGEST_DISCARD_PREFIX = "ai:suggest:discard:";
+const AI_FAQ_APPROVE_PREFIX = "ai:faq:approve:";
+const AI_FAQ_DISCARD_PREFIX = "ai:faq:discard:";
+const MODERATION_WINDOW_MS = 60_000;
+const MODERATION_COOLDOWN_MS = 60_000;
+const PENDING_ACTION_TTL_MS = 24 * 60 * 60 * 1000;
+const EPHEMERAL_PRUNE_INTERVAL_MS = 10 * 60_000;
+
+const pendingReplySuggestions = new Map<string, {
+  channelId: string;
+  ticketId: string;
+  text: string;
+  createdBy: string;
+  createdAt: number;
+}>();
+const pendingFaqDrafts = new Map<string, {
+  draft: FaqDraft;
+  ticketId: string;
+  createdAt: number;
+}>();
+
+const intents = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.GuildModeration
+];
+
+if (config.ENABLE_MEMBER_MONITORING || config.ENABLE_NEW_ACCOUNT_PROTECTION) {
+  intents.push(GatewayIntentBits.GuildMembers);
+}
+
+if (config.ENABLE_MESSAGE_QA || config.ENABLE_AI_ASSISTANT || config.ENABLE_SUPPORT_MESSAGE_CONTENT || config.ENABLE_MODERATION_CONTENT) {
+  intents.push(GatewayIntentBits.MessageContent);
+}
+
+const client = new Client({
+  intents
+});
+
+let shuttingDown = false;
+
+async function shutdown(reason: string, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Shutting down (${reason})...`);
+  // Safety net: never let shutdown hang (e.g. a stuck Discord request).
+  setTimeout(() => process.exit(exitCode), 5000).unref();
+  try {
+    await flushPendingWrites();
+  } catch (flushError) {
+    console.error("Error while flushing writes on shutdown", flushError);
+  }
+  try {
+    await client.destroy();
+  } catch {
+    // ignore
+  }
+  process.exit(exitCode);
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
+
+process.on("unhandledRejection", (error) => {
+  console.error("Unhandled rejection", error);
+  void logErrorToDiscord({
+    title: "Unhandled rejection",
+    error
+  });
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception", error);
+  // The process is in an undefined state: flush pending writes, then exit so the
+  // container's restart policy brings up a clean instance.
+  void logErrorToDiscord({
+    title: "Uncaught exception",
+    error
+  }).catch(() => undefined);
+  void shutdown("uncaughtException", 1);
+});
+
+type SendableChannel = {
+  send(payload: { content?: string; embeds?: EmbedBuilder[]; files?: AttachmentBuilder[]; components?: unknown[] }): Promise<unknown>;
+};
+
+function canSend(channel: unknown): channel is SendableChannel {
+  return Boolean(channel && typeof (channel as { send?: unknown }).send === "function");
+}
+
+function ticketNumber(value: number) {
+  return String(value).padStart(4, "0");
+}
+
+function supportStatusLabel(status: SupportStatus) {
+  if (status === "online") return "Online";
+  if (status === "busy") return "Beschaeftigt";
+  return "Offline";
+}
+
+function supportStatusColor(status: SupportStatus) {
+  if (status === "online") return 0x2ecc71;
+  if (status === "busy") return 0xf1c40f;
+  return 0x95a5a6;
+}
+
+function priorityLabel(priority?: string) {
+  if (priority === "urgent") return "Dringend";
+  if (priority === "high") return "Hoch";
+  if (priority === "low") return "Niedrig";
+  return "Normal";
+}
+
+function priorityColor(priority?: string) {
+  if (priority === "urgent") return 0xe74c3c;
+  if (priority === "high") return 0xe67e22;
+  if (priority === "low") return 0x95a5a6;
+  return 0x3498db;
+}
+
+function normalizeMessageContent(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, "[link]")
+    .replace(/www\.\S+/g, "[link]")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function countLinks(value: string) {
+  return value.match(/(?:https?:\/\/|www\.)\S+/gi)?.length ?? 0;
+}
+
+function findDiscordInviteCodes(value: string) {
+  const codes = new Set<string>();
+  const regex = /(?:https?:\/\/)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com\/invite)\/([a-z0-9-]+)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(value))) {
+    codes.add(match[1]);
+  }
+  return [...codes];
+}
+
+function looksLikeCapsSpam(value: string) {
+  // Unicode-aware so German umlauts (ä/ö/ü) and other accented letters count too.
+  // A char is "uppercase" only if it has a distinct lowercase form and already
+  // equals its own uppercase form (ß stays lowercase, digits/symbols are ignored).
+  const letters = [...value].filter((char) => /\p{L}/u.test(char));
+  if (letters.length < 12) return false;
+  const uppercase = letters.filter((char) => char !== char.toLowerCase() && char === char.toUpperCase()).length;
+  return uppercase / letters.length >= 0.75;
+}
+
+function messageEvidence(value: string) {
+  return value.replace(/\s+/g, " ").trim().slice(0, 180);
+}
+
+function accountAgeDays(user: User) {
+  return Math.max(0, Math.floor((Date.now() - user.createdTimestamp) / 86_400_000));
+}
+
+function isNewAccount(user: User) {
+  return accountAgeDays(user) < config.NEW_ACCOUNT_WARN_DAYS;
+}
+
+function isStrictNewAccount(user: User) {
+  return accountAgeDays(user) < config.NEW_ACCOUNT_STRICT_DAYS;
+}
+
+function scamPhraseMatches(value: string, hasLink: boolean, strictForNewAccount: boolean) {
+  const normalized = value.toLowerCase();
+  const matches: string[] = [];
+
+  const patterns = [
+    { label: "Free Nitro", regex: /\b(free|gratis|kostenlos).{0,30}(nitro|discord nitro)\b/i },
+    { label: "Steam Gift", regex: /\b(steam|gift|geschenk).{0,40}(claim|holen|abholen|kostenlos|free|gratis)\b/i },
+    { label: "Wallet/Seed Scam", regex: /\b(seed phrase|private key|wallet verification|verify wallet|metamask|airdrop)\b/i },
+    { label: "Account Verification", regex: /\b(verify account|konto verifizieren|account verifizieren|security check)\b/i },
+    { label: "Claim/Reward", regex: /\b(claim now|claim reward|jetzt sichern|belohnung abholen|preis abholen)\b/i }
+  ];
+
+  for (const pattern of patterns) {
+    if (pattern.regex.test(value)) matches.push(pattern.label);
+  }
+
+  if (hasLink && /\b(giveaway|verlosung|gewinnspiel|prize|reward|bonus)\b/i.test(value)) {
+    matches.push("Giveaway-Link");
+  }
+
+  if (strictForNewAccount && hasLink && /\b(nitro|steam|gift|crypto|wallet|airdrop|verify|claim|gratis|kostenlos|gewinn|prize|bonus)\b/i.test(normalized)) {
+    matches.push("Neuer Account mit riskantem Link");
+  }
+
+  return [...new Set(matches)];
+}
+
+function stripBotMention(value: string) {
+  if (!client.user) return value;
+  return value
+    .replace(new RegExp(`<@!?${client.user.id}>`, "g"), "")
+    .replace(/^jellybot\s+/i, "")
+    .trim();
+}
+
+function readableChannelName(channel: unknown) {
+  const name = channel && typeof channel === "object" && "name" in channel
+    ? (channel as { name?: string | null }).name
+    : undefined;
+  return name ?? undefined;
+}
+
+async function sendTypingIfPossible(channel: unknown) {
+  const sendTyping = channel && typeof channel === "object" && "sendTyping" in channel
+    ? (channel as { sendTyping?: () => Promise<unknown> }).sendTyping
+    : undefined;
+  await sendTyping?.call(channel).catch(() => undefined);
+}
+
+function extractMediaQuery(value: string) {
+  const quoted = value.match(/["'`„“”]([^"'`„“”]{2,80})["'`„“”]/);
+  if (quoted?.[1]) return quoted[1].trim();
+
+  const afterType = value.match(/\b(?:film|serie|staffel|media|medium)\s+(.{2,80})/i)?.[1];
+  const raw = afterType ?? value;
+  const cleaned = raw
+    .replace(/<@!?\d+>/g, " ")
+    .replace(/[?.!,;:()[\]{}]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter((word) => ![
+      "warum", "wieso", "wann", "wo", "ist", "sind", "der", "die", "das", "den", "dem", "ein", "eine",
+      "noch", "nicht", "da", "drauf", "auf", "jellyfin", "film", "serie", "staffel", "kommt", "kommen",
+      "gibt", "es", "kannst", "du", "mal", "bitte", "pruefen", "prüfen", "laden", "neu", "reload", "fehlt"
+    ].includes(word.toLowerCase()))
+    .join(" ")
+    .trim();
+
+  return cleaned.length >= 2 && cleaned.length <= 80 ? cleaned : undefined;
+}
+
+function looksLikeMediaQuestion(value: string) {
+  return /\b(film|serie|staffel|medien|jellyfin|bibliothek|scan|reload|fehlt|nicht da|noch nicht|warum|wieso)\b/i.test(value);
+}
+
+function assistantActionComponents(question: string, context: AssistantContext) {
+  if (!config.JELLYFIN_BASE_URL || !config.JELLYFIN_API_KEY) return [];
+  if (!looksLikeMediaQuestion(question) && !context.mediaQuery) return [];
+
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(AI_LIBRARY_SCAN_BUTTON_ID)
+        .setLabel("Bibliothek scannen")
+        .setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+
+function canWarnForRule(userId: string, rule: string) {
+  const key = `${userId}:${rule}`;
+  const now = Date.now();
+  const previous = moderationCooldowns.get(key) ?? 0;
+  if (now - previous < MODERATION_COOLDOWN_MS) return false;
+  moderationCooldowns.set(key, now);
+  return true;
+}
+
+function escalationTimeoutMinutes(activeWarnings: number) {
+  if (activeWarnings < config.WARNINGS_BEFORE_TIMEOUT) return 0;
+  const level = activeWarnings - config.WARNINGS_BEFORE_TIMEOUT;
+  const multiplier = level <= 0 ? 1 : level === 1 ? 3 : 6;
+  return Math.min(config.TIMEOUT_MINUTES * multiplier, 10080);
+}
+
+function slugify(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24) || "user";
+}
+
+function channelNameKey(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9-]+/g, "");
+}
+
+function paymentUrl() {
+  return `${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/pay`;
+}
+
+function ticketEntryEmbed() {
+  return new EmbedBuilder()
+    .setTitle("Support-Tickets")
+    .setDescription([
+      "Bitte oeffne fuer Support ein privates Ticket.",
+      "",
+      "**So geht es:**",
+      "1. Klicke unten auf `Ticket oeffnen`.",
+      "2. Fuell das kurze Formular aus.",
+      "3. Der Bot erstellt daraus ein privates Ticket.",
+      "",
+      "Slash-Command als Backup: `/ticket create` funktioniert nur in diesem Kanal.",
+      "Alternativ kannst du hier eine Nachricht schreiben. Der Bot erstellt daraus automatisch ein Ticket und entfernt die Nachricht aus diesem Eingangskanal.",
+      "",
+      "Bitte poste hier keine Passwoerter, Tokens oder privaten Zahlungsdaten."
+    ].join("\n"))
+    .setColor(0x3498db)
+    .setFooter({ text: "HOJ_TICKET_ENTRY" });
+}
+
+function ticketEntryComponents() {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(TICKET_CREATE_BUTTON_ID)
+        .setLabel("Ticket oeffnen")
+        .setStyle(ButtonStyle.Primary)
+    )
+  ];
+}
+
+// Roles that count as support team when no explicit DISCORD_SUPPORT_ROLE_ID /
+// DISCORD_ADMIN_ROLE_ID is configured. Kept as a documented fallback (see README);
+// for stable, rename-proof authorization configure the role IDs in .env instead.
+const TEAM_ROLE_NAMES = ["Support", "Moderator", "Admin"] as const;
+
+function isModerator(member: GuildMember) {
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  if (member.permissions.has(PermissionFlagsBits.ModerateMembers)) return true;
+  if (config.DISCORD_ADMIN_ROLE_ID && member.roles.cache.has(config.DISCORD_ADMIN_ROLE_ID)) return true;
+  if (config.DISCORD_SUPPORT_ROLE_ID && member.roles.cache.has(config.DISCORD_SUPPORT_ROLE_ID)) return true;
+  return false;
+}
+
+function hasNamedRole(member: GuildMember, names: string[]) {
+  const wanted = new Set(names.map((name) => name.toLowerCase()));
+  return member.roles.cache.some((role) => wanted.has(role.name.toLowerCase()));
+}
+
+function isTicketTeamMember(member: GuildMember) {
+  return isModerator(member) || hasNamedRole(member, [...TEAM_ROLE_NAMES]);
+}
+
+// Defence-in-depth: setDefaultMemberPermissions() in commands.ts is only a client
+// hint that a guild admin can override in the Integrations settings. Privileged
+// command handlers re-check the permission at runtime so a misconfigured guild
+// can never expose them to non-moderators.
+function memberHasGuildPermission(member: GuildMember, permission: bigint) {
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  if (member.permissions.has(permission)) return true;
+  if (config.DISCORD_ADMIN_ROLE_ID && member.roles.cache.has(config.DISCORD_ADMIN_ROLE_ID)) return true;
+  return false;
+}
+
+async function ensureCommandPermission(
+  interaction: ChatInputCommandInteraction,
+  check: (member: GuildMember) => boolean
+) {
+  const member = await getInteractionMember(interaction);
+  if (member && check(member)) return true;
+  const content = "Dir fehlt die Berechtigung fuer diesen Befehl.";
+  if (interaction.deferred || interaction.replied) await interaction.editReply(content);
+  else await interaction.reply({ ephemeral: true, content });
+  return false;
+}
+
+async function getInteractionMember(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return null;
+  if (interaction.member instanceof GuildMember) return interaction.member;
+  return interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+}
+
+async function logToDiscord(guild: Guild, embed: EmbedBuilder) {
+  const configured = config.DISCORD_LOG_CHANNEL_ID
+    ? await guild.channels.fetch(config.DISCORD_LOG_CHANNEL_ID).catch(() => null)
+    : null;
+  const fallback = configured ?? guild.channels.cache.find((channel) =>
+    channel.isTextBased() && ["mod-log", "logs", "bot-log"].includes(channel.name)
+  );
+
+  if (canSend(fallback)) {
+    await fallback.send({ embeds: [embed] }).catch(() => undefined);
+  }
+}
+
+function redactSensitive(value: string) {
+  let redacted = value;
+  for (const secret of [config.DISCORD_TOKEN, config.OPENAI_API_KEY, config.JELLYFIN_API_KEY]) {
+    if (secret) redacted = redacted.split(secret).join("[redacted]");
+  }
+
+  return redacted
+    .replace(/Bot\s+[A-Za-z0-9._-]+/g, "Bot [redacted]")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/g, "Bearer [redacted]")
+    .replace(/sk-[A-Za-z0-9_-]{12,}/g, "sk-[redacted]")
+    .replace(/(x-emby-token["'\s:=]+)[A-Za-z0-9._-]+/gi, "$1[redacted]");
+}
+
+function errorToText(error: unknown) {
+  if (error instanceof Error) {
+    return redactSensitive(error.stack || error.message || error.name);
+  }
+
+  try {
+    return redactSensitive(JSON.stringify(error, null, 2));
+  } catch {
+    return redactSensitive(String(error));
+  }
+}
+
+function codeBlock(value: string, maxLength = 3500) {
+  const safe = value.replace(/```/g, "'''").slice(0, maxLength);
+  return `\`\`\`\n${safe || "Kein Fehlertext"}\n\`\`\``;
+}
+
+async function logErrorToDiscord(options: {
+  guild?: Guild | null;
+  title: string;
+  error: unknown;
+  context?: Record<string, string | number | boolean | null | undefined>;
+}) {
+  const embed = new EmbedBuilder()
+    .setTitle(`Bot-Fehler: ${options.title}`.slice(0, 256))
+    .setDescription(codeBlock(errorToText(options.error)))
+    .setColor(0xe74c3c)
+    .setTimestamp();
+
+  const fields = Object.entries(options.context ?? {})
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .slice(0, 8)
+    .map(([name, value]) => ({
+      name: name.slice(0, 256),
+      value: String(value).slice(0, 1024),
+      inline: true
+    }));
+  if (fields.length) embed.addFields(fields);
+
+  const guilds = options.guild ? [options.guild] : [...client.guilds.cache.values()];
+  for (const guild of guilds) {
+    await logToDiscord(guild, embed).catch((logError) => {
+      console.error("Discord error logging failed", logError);
+    });
+  }
+}
+
+async function warnAndEscalate(options: {
+  guild: Guild;
+  member: GuildMember;
+  reason: string;
+  source: WarningSource;
+  moderatorId: string;
+  channelId?: string;
+  messageId?: string;
+  evidence?: string;
+}) {
+  const { entry, total } = await store.addWarning(options.member.id, {
+    reason: options.reason,
+    moderatorId: options.moderatorId,
+    source: options.source,
+    channelId: options.channelId,
+    messageId: options.messageId,
+    evidence: options.evidence
+  });
+
+  const timeoutMinutes = escalationTimeoutMinutes(total);
+  let timeoutApplied = false;
+  if (timeoutMinutes > 0 && options.member.moderatable) {
+    await options.member.timeout(
+      timeoutMinutes * 60_000,
+      `Automatische Eskalation nach ${total} aktiven Warnungen`
+    ).catch(() => undefined);
+    timeoutApplied = true;
+  }
+
+  await logToDiscord(options.guild, new EmbedBuilder()
+    .setTitle(options.source === "auto" ? "Automatische Warnung" : "Manuelle Warnung")
+    .setDescription(`<@${options.member.id}> wurde verwarnt.`)
+    .addFields(
+      { name: "Grund", value: options.reason.slice(0, 1024) },
+      { name: "Warnungen", value: String(total), inline: true },
+      { name: "ID", value: entry.id, inline: true },
+      { name: "Eskalation", value: timeoutApplied ? `Timeout: ${timeoutMinutes} Minuten` : "Keine", inline: true }
+    )
+    .setColor(options.source === "auto" ? 0xf1c40f : 0xe67e22)
+    .setTimestamp());
+
+  return { entry, total, timeoutMinutes, timeoutApplied };
+}
+
+async function moderationMember(message: Message) {
+  if (!message.guild) return null;
+  const member = await message.guild.members.fetch(message.author.id).catch(() => null);
+  if (!member || isModerator(member)) return null;
+  return member;
+}
+
+async function handleInviteProtectionMessage(message: Message) {
+  if (!config.ENABLE_INVITE_LINK_PROTECTION || !message.guild || !message.content) return false;
+  const codes = findDiscordInviteCodes(message.content);
+  if (!codes.length) return false;
+
+  const member = await moderationMember(message);
+  if (!member) return false;
+
+  for (const code of codes) {
+    const invite = await client.fetchInvite(code).catch(() => null);
+    const inviteGuildId = invite?.guild?.id;
+    if (inviteGuildId === message.guild.id) continue;
+
+    await message.delete().catch(() => undefined);
+    if (canWarnForRule(message.author.id, "foreign_invite")) {
+      const reason = inviteGuildId
+        ? "Fremder Discord-Invite gepostet"
+        : "Unbekannter oder ungueltiger Discord-Invite gepostet";
+      const result = await warnAndEscalate({
+        guild: message.guild,
+        member,
+        reason,
+        source: "auto",
+        moderatorId: client.user?.id ?? "bot",
+        channelId: message.channelId,
+        messageId: message.id,
+        evidence: code
+      });
+      if (canSend(message.channel)) {
+        await message.channel.send({
+          content: `<@${message.author.id}> fremde Discord-Einladungen sind hier nicht erlaubt. Warnungen: ${result.total}`
+        }).catch(() => undefined);
+      }
+    }
+    return true;
+  }
+
+  return false;
+}
+
+async function handleScamPhraseMessage(message: Message) {
+  if (!config.ENABLE_SCAM_PHRASE_PROTECTION || !message.guild || !message.content) return false;
+
+  const member = await moderationMember(message);
+  if (!member) return false;
+
+  const hasLink = countLinks(message.content) > 0;
+  const matches = scamPhraseMatches(message.content, hasLink, isStrictNewAccount(message.author));
+  if (!matches.length) return false;
+
+  await message.delete().catch(() => undefined);
+  if (!canWarnForRule(message.author.id, "scam_phrase")) return true;
+
+  const reason = `Moegliche Scam-/Phishing-Nachricht: ${matches.join(", ")}`;
+  const result = await warnAndEscalate({
+    guild: message.guild,
+    member,
+    reason,
+    source: "auto",
+    moderatorId: client.user?.id ?? "bot",
+    channelId: message.channelId,
+    messageId: message.id,
+    evidence: messageEvidence(message.content)
+  });
+
+  if (canSend(message.channel)) {
+    await message.channel.send({
+      content: `<@${message.author.id}> diese Nachricht wurde als moeglicher Scam geloescht. Warnungen: ${result.total}`
+    }).catch(() => undefined);
+  }
+
+  return true;
+}
+
+async function handleAdvancedAntiSpamMessage(message: Message) {
+  if (!config.ENABLE_ADVANCED_ANTI_SPAM || !message.guild) return false;
+
+  const member = await moderationMember(message);
+  if (!member) return false;
+
+  const now = Date.now();
+  const content = message.content.trim();
+  const contentKey = normalizeMessageContent(content);
+  const linkCount = countLinks(content);
+  const mentionCount =
+    message.mentions.users.size +
+    message.mentions.roles.size +
+    (message.mentions.everyone ? 5 : 0);
+  const previous = (recentMessages.get(message.author.id) ?? [])
+    .filter((item) => now - item.at <= MODERATION_WINDOW_MS);
+  const current: RecentUserMessage = { at: now, contentKey, linkCount, mentionCount };
+  const recent = [...previous, current];
+  recentMessages.set(message.author.id, recent);
+
+  const repeatCount = contentKey.length >= 6
+    ? recent.filter((item) => item.contentKey === contentKey).length
+    : 0;
+  const linkMessages = recent.filter((item) => item.linkCount > 0).length;
+  const recentLinkCount = recent.reduce((sum, item) => sum + item.linkCount, 0);
+  const recentMentionCount = recent.reduce((sum, item) => sum + item.mentionCount, 0);
+  const strictNewAccount = isStrictNewAccount(message.author);
+
+  const reasons: string[] = [];
+  const rules: string[] = [];
+  if (recent.length > config.MAX_MESSAGES_PER_MINUTE) {
+    rules.push("message_rate");
+    reasons.push(`${recent.length} Nachrichten in kurzer Zeit`);
+  }
+  if (repeatCount >= 3) {
+    rules.push("repeated_message");
+    reasons.push("Wiederholte gleiche Nachricht");
+  }
+  if (content && looksLikeCapsSpam(content)) {
+    rules.push("caps_spam");
+    reasons.push("Zu viel Grossschreibung");
+  }
+  if (linkCount >= 3 || linkMessages >= 4 || recentLinkCount >= 6) {
+    rules.push("link_spam");
+    reasons.push("Zu viele Links in kurzer Zeit");
+  }
+  if (mentionCount >= 5 || recentMentionCount >= 8) {
+    rules.push("mention_spam");
+    reasons.push("Zu viele Mentions in kurzer Zeit");
+  }
+  if (strictNewAccount && linkCount > 0) {
+    rules.push("new_account_link");
+    reasons.push(`Sehr neuer Account (${accountAgeDays(message.author)} Tage) mit Link`);
+  }
+  if (strictNewAccount && mentionCount >= 2) {
+    rules.push("new_account_mentions");
+    reasons.push(`Sehr neuer Account (${accountAgeDays(message.author)} Tage) mit mehreren Mentions`);
+  }
+
+  if (!rules.length) return false;
+
+  await message.delete().catch(() => undefined);
+  const rule = rules[0];
+  if (!canWarnForRule(message.author.id, rule)) return true;
+
+  const result = await warnAndEscalate({
+    guild: message.guild,
+    member,
+    reason: reasons.join("; "),
+    source: "auto",
+    moderatorId: client.user?.id ?? "bot",
+    channelId: message.channelId,
+    messageId: message.id,
+    evidence: messageEvidence(content)
+  });
+
+  if (canSend(message.channel)) {
+    await message.channel.send({
+      content: `<@${message.author.id}> bitte Spam vermeiden. Grund: ${reasons[0]}. Warnungen: ${result.total}`
+    }).catch(() => undefined);
+  }
+
+  return true;
+}
+
+async function logTicket(guild: Guild, embed: EmbedBuilder) {
+  const configured = config.DISCORD_TICKET_LOG_CHANNEL_ID
+    ? await guild.channels.fetch(config.DISCORD_TICKET_LOG_CHANNEL_ID).catch(() => null)
+    : null;
+
+  if (canSend(configured)) {
+    await configured.send({ embeds: [embed] }).catch(() => undefined);
+    return;
+  }
+
+  await logToDiscord(guild, embed);
+}
+
+async function sendTicketLogPayload(guild: Guild, payload: { embeds?: EmbedBuilder[]; content?: string; components?: unknown[]; files?: AttachmentBuilder[] }) {
+  const configured = config.DISCORD_TICKET_LOG_CHANNEL_ID
+    ? await guild.channels.fetch(config.DISCORD_TICKET_LOG_CHANNEL_ID).catch(() => null)
+    : null;
+  const fallback = configured ?? guild.channels.cache.find((channel) =>
+    channel.isTextBased() && ["support-log", "ticket-log", "mod-log", "bot-log"].includes(channel.name)
+  );
+
+  if (canSend(fallback)) {
+    await fallback.send(payload).catch(() => undefined);
+    return true;
+  }
+
+  if (payload.embeds?.[0]) await logToDiscord(guild, payload.embeds[0]);
+  return false;
+}
+
+async function logTicketWithTranscript(guild: Guild, embed: EmbedBuilder, transcriptPath?: string) {
+  const configured = config.DISCORD_TICKET_LOG_CHANNEL_ID
+    ? await guild.channels.fetch(config.DISCORD_TICKET_LOG_CHANNEL_ID).catch(() => null)
+    : null;
+  const fallback = configured ?? guild.channels.cache.find((channel) =>
+    channel.isTextBased() && ["support-log", "ticket-log", "mod-log", "bot-log"].includes(channel.name)
+  );
+
+  if (!canSend(fallback)) {
+    await logToDiscord(guild, embed);
+    return;
+  }
+
+  const files = transcriptPath ? [new AttachmentBuilder(transcriptPath)] : undefined;
+  await fallback.send({ embeds: [embed], files }).catch(() => undefined);
+}
+
+function settledStatus<T>(result: PromiseSettledResult<T>, ok: (value: T) => string, fallback: string) {
+  return result.status === "fulfilled" ? ok(result.value) : fallback;
+}
+
+async function buildAssistantContext(options: {
+  guild: Guild;
+  channelId: string;
+  channelName?: string;
+  user: User;
+  question: string;
+}) {
+  const mediaQuery = extractMediaQuery(options.question);
+  const [portal, jellyfin, sessions, supportState, ticket, media, faqTopics] = await Promise.allSettled([
+    getPortalHealth(),
+    getJellyfinInfo(),
+    getActiveSessionCount(),
+    supportStore.get(),
+    ticketStore.getByChannel(options.guild.id, options.channelId),
+    mediaQuery ? searchJellyfinMedia(mediaQuery) : Promise.resolve(undefined),
+    allFaqTopics()
+  ]);
+
+  const ticketValue = ticket.status === "fulfilled" ? ticket.value : undefined;
+  const supportValue = supportState.status === "fulfilled" ? supportState.value : undefined;
+  const mediaValue = media.status === "fulfilled" ? media.value : undefined;
+
+  return {
+    guildName: options.guild.name,
+    channelName: options.channelName,
+    userTag: options.user.tag,
+    isTicketChannel: Boolean(ticketValue?.status === "open"),
+    ticketSubject: ticketValue?.subject,
+    supportStatus: supportValue
+      ? `${supportStatusLabel(supportValue.status)}: ${supportValue.message}`
+      : "Unbekannt",
+    portalStatus: settledStatus(portal, (value) =>
+      value.ok ? `Online (${value.shop ?? "Shop"})` : "Nicht erreichbar", "Nicht erreichbar"),
+    jellyfinStatus: settledStatus(jellyfin, (value) =>
+      value.configured
+        ? `${value.info.ServerName ?? "Jellyfin"} ${value.info.Version ?? ""}`.trim()
+        : "Nicht konfiguriert", "Nicht erreichbar"),
+    activeSessions: sessions.status === "fulfilled" ? sessions.value : undefined,
+    mediaQuery,
+    mediaSearchStatus: mediaValue
+      ? mediaValue.configured
+        ? `${mediaValue.total} Treffer`
+        : "Jellyfin API-Key fehlt oder ist nicht konfiguriert"
+      : mediaQuery
+        ? "Suche fehlgeschlagen oder ohne Ergebnis"
+        : "Nicht gesucht",
+    mediaItems: mediaValue?.items ?? [],
+    paymentUrl: paymentUrl(),
+    faqTopics: faqTopics.status === "fulfilled" ? faqTopics.value : listFaqTopics()
+  } satisfies AssistantContext;
+}
+
+// Every AI-generated answer is posted without human review, so it carries a
+// visible disclaimer making clear it is machine-generated and not binding. The
+// "-#" prefix renders as Discord subtext (small, muted).
+const AI_ANSWER_DISCLAIMER =
+  "\n\n-# KI-generierte Antwort - ohne Gewaehr. Bei wichtigen oder verbindlichen Fragen bitte ein Ticket oeffnen.";
+
+async function answerWithAiAssistant(options: {
+  guild: Guild;
+  channelId: string;
+  channelName?: string;
+  user: User;
+  question: string;
+  reply: (payload: { content: string; components?: ActionRowBuilder<ButtonBuilder>[] }) => Promise<unknown>;
+}) {
+  if (!isOpenAiAssistantReady()) return false;
+  const context = await buildAssistantContext(options);
+  const answer = await generateAssistantReply(options.question, context);
+  await options.reply({
+    content: `${answer}${AI_ANSWER_DISCLAIMER}`,
+    components: assistantActionComponents(options.question, context)
+  });
+  return true;
+}
+
+async function allFaqTopics() {
+  const dynamic = await faqStore.list();
+  return [...new Set([...listFaqTopics(), ...dynamic.map((item) => item.title)])];
+}
+
+async function searchAllFaqItems(input: string, limit = 8) {
+  const staticItems = searchFaqItems(input, limit);
+  const dynamicItems = await faqStore.search(input, limit);
+  const byTitle = new Map<string, typeof staticItems[number]>();
+  for (const item of [...staticItems, ...dynamicItems]) {
+    byTitle.set(item.title.toLowerCase(), item);
+  }
+  return [...byTitle.values()].slice(0, limit);
+}
+
+async function answerAnyQuestion(input: string) {
+  return answerQuestion(input) ?? await faqStore.answer(input);
+}
+
+function ticketTeamRoleIds(guild: Guild) {
+  const ids = new Set<string>();
+  for (const roleId of [config.DISCORD_SUPPORT_ROLE_ID, config.DISCORD_ADMIN_ROLE_ID]) {
+    if (roleId && guild.roles.cache.has(roleId)) ids.add(roleId);
+  }
+
+  for (const name of TEAM_ROLE_NAMES) {
+    const role = guild.roles.cache.find((item) => item.name.toLowerCase() === name.toLowerCase());
+    if (role) ids.add(role.id);
+  }
+
+  return [...ids];
+}
+
+function ticketPermissionOverwrites(guild: Guild, ownerId?: string, participantIds: string[] = []) {
+  const userAllow = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ReadMessageHistory,
+    PermissionFlagsBits.UseApplicationCommands
+  ];
+
+  const overwrites = [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    {
+      id: client.user?.id ?? guild.client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.ManageChannels
+      ]
+    },
+    ...ticketTeamRoleIds(guild).map((roleId) => ({
+      id: roleId,
+      allow: userAllow
+    }))
+  ];
+
+  if (ownerId) overwrites.push({ id: ownerId, allow: userAllow });
+  for (const participantId of participantIds) {
+    if (participantId !== ownerId) overwrites.push({ id: participantId, allow: userAllow });
+  }
+
+  return overwrites;
+}
+
+async function ensureTicketCategory(guild: Guild) {
+  if (config.DISCORD_TICKET_CATEGORY_ID) {
+    const configured = await guild.channels.fetch(config.DISCORD_TICKET_CATEGORY_ID).catch(() => null);
+    if (configured?.type === ChannelType.GuildCategory) return configured;
+  }
+
+  const existing = guild.channels.cache.find((channel) =>
+    channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === "tickets"
+  );
+  if (existing?.type === ChannelType.GuildCategory) return existing;
+
+  return guild.channels.create({
+    name: "TICKETS",
+    type: ChannelType.GuildCategory,
+    permissionOverwrites: ticketPermissionOverwrites(guild),
+    reason: "Jellyfin ticket system setup"
+  });
+}
+
+async function findTicketEntryChannel(guild: Guild) {
+  if (config.DISCORD_TICKET_ENTRY_CHANNEL_ID) {
+    const configured = await guild.channels.fetch(config.DISCORD_TICKET_ENTRY_CHANNEL_ID).catch(() => null);
+    if (configured?.type === ChannelType.GuildText) return configured;
+  }
+
+  await guild.channels.fetch().catch(() => null);
+  const support = guild.channels.cache.find((channel) =>
+    channel.type === ChannelType.GuildText &&
+    (channel.name.toLowerCase() === "support" || channelNameKey(channel.name) === "support")
+  );
+  if (support?.type === ChannelType.GuildText) return support;
+
+  return undefined;
+}
+
+async function isTicketEntryChannel(guild: Guild, channelId: string) {
+  const entryChannel = await findTicketEntryChannel(guild);
+  return entryChannel?.id === channelId;
+}
+
+async function ensureTicketEntryInstructions(guild: Guild) {
+  const channel = await findTicketEntryChannel(guild);
+  if (!channel) return false;
+
+  await channel.setTopic("Ticket-Eingang: Button Ticket oeffnen, /ticket create oder Nachricht nutzen.").catch(() => undefined);
+
+  const recent = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+  const matchesInstruction = (message: Message) =>
+    message.author.id === client.user?.id &&
+    (
+      message.embeds.some((embed) => embed.footer?.text === "HOJ_TICKET_ENTRY") ||
+      message.content.startsWith("[HOJ_SETUP_SUPPORT]") ||
+      message.content.startsWith("**Support")
+    );
+  const matches = Array.from(recent?.filter(matchesInstruction).values() ?? [])
+    .sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+  const existing = matches[0];
+  for (const duplicate of matches.slice(1).values()) {
+    await duplicate.delete().catch(() => undefined);
+  }
+
+  if (existing) {
+    await existing.edit({ content: "", embeds: [ticketEntryEmbed()], components: ticketEntryComponents() }).catch(() => undefined);
+    await existing.pin().catch(() => undefined);
+    return true;
+  }
+
+  const sent = await channel.send({ embeds: [ticketEntryEmbed()], components: ticketEntryComponents() }).catch(() => null);
+  await sent?.pin().catch(() => undefined);
+  return Boolean(sent);
+}
+
+async function getExistingOpenTickets(guild: Guild, userId: string) {
+  const openTickets = await ticketStore.getOpenByOwner(guild.id, userId);
+  const existingOpenTickets: Ticket[] = [];
+  for (const ticket of openTickets) {
+    const channel = await guild.channels.fetch(ticket.channelId).catch(() => null);
+    if (channel) existingOpenTickets.push(ticket);
+    else await ticketStore.close(ticket.id, client.user?.id ?? "bot", "Ticket-Kanal fehlt");
+  }
+
+  return existingOpenTickets;
+}
+
+// Serialise ticket creation per (guild,user) so two near-simultaneous requests
+// (e.g. double-clicking the panel button) can't both pass the open-ticket limit
+// check before either has created its channel (TOCTOU).
+const ticketCreationChains = new Map<string, Promise<unknown>>();
+
+function withTicketCreationLock<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const previous = ticketCreationChains.get(key) ?? Promise.resolve();
+  const run = previous.then(task, task);
+  function cleanup() {
+    if (ticketCreationChains.get(key) === tracked) ticketCreationChains.delete(key);
+  }
+  const tracked = run.then(cleanup, cleanup);
+  ticketCreationChains.set(key, tracked);
+  return run;
+}
+
+async function createTicketWithLimit(
+  guild: Guild,
+  userId: string,
+  options: Parameters<typeof createTicketForUser>[0]
+): Promise<
+  | { limited: true; existing: Ticket }
+  | { limited: false; result: Awaited<ReturnType<typeof createTicketForUser>> }
+> {
+  return withTicketCreationLock(`${guild.id}:${userId}`, async () => {
+    const existingOpenTickets = await getExistingOpenTickets(guild, userId);
+    if (existingOpenTickets.length >= config.MAX_OPEN_TICKETS_PER_USER) {
+      return { limited: true as const, existing: existingOpenTickets[0] };
+    }
+    const result = await createTicketForUser(options);
+    return { limited: false as const, result };
+  });
+}
+
+async function recordTicketChannelActivity(message: Message) {
+  if (!message.guild || message.author.bot) return;
+  const ticket = await ticketStore.getByChannel(message.guild.id, message.channelId);
+  if (!ticket || ticket.status !== "open") return;
+
+  const member = await message.guild.members.fetch(message.author.id).catch(() => null);
+  const authorType = member && isTicketTeamMember(member) ? "team" : "user";
+  await ticketStore.recordMessage(ticket.id, authorType);
+}
+
+function ticketWaitingSince(ticket: Ticket) {
+  const lastUserMessageAt = ticket.lastUserMessageAt ?? ticket.createdAt;
+  const lastTeamMessageAt = ticket.lastTeamMessageAt;
+  if (lastTeamMessageAt && new Date(lastTeamMessageAt).getTime() >= new Date(lastUserMessageAt).getTime()) return undefined;
+  if (ticket.lastFollowUpAt && new Date(ticket.lastFollowUpAt).getTime() >= new Date(lastUserMessageAt).getTime()) return undefined;
+
+  const dueAt = new Date(lastUserMessageAt).getTime() + config.TICKET_FOLLOWUP_HOURS * 60 * 60 * 1000;
+  return Date.now() >= dueAt ? lastUserMessageAt : undefined;
+}
+
+async function checkTicketFollowUps() {
+  if (!config.ENABLE_TICKET_FOLLOWUPS) return;
+
+  for (const guild of client.guilds.cache.values()) {
+    const tickets = await ticketStore.listOpen(guild.id);
+    for (const ticket of tickets) {
+      const waitingSince = ticketWaitingSince(ticket);
+      if (!waitingSince) continue;
+
+      const channel = await guild.channels.fetch(ticket.channelId).catch(() => null);
+      if (!canSend(channel)) continue;
+
+      const teamMentions = ticketTeamRoleIds(guild).map((roleId) => `<@&${roleId}>`).join(" ");
+      const sent = await channel.send({
+        content: teamMentions || undefined,
+        embeds: [new EmbedBuilder()
+          .setTitle("Ticket wartet auf Antwort")
+          .setDescription([
+            `Dieses Ticket wartet seit <t:${Math.floor(new Date(waitingSince).getTime() / 1000)}:R> auf eine Team-Antwort.`,
+            "",
+            "Bitte kurz reagieren, eine Rueckfrage stellen oder das Ticket schliessen, wenn es erledigt ist."
+          ].join("\n"))
+          .addFields(
+            { name: "Ticket", value: `#${ticketNumber(ticket.number)} ${ticket.subject}`, inline: true },
+            { name: "User", value: `<@${ticket.ownerId}>`, inline: true }
+          )
+          .setColor(0xf1c40f)
+          .setTimestamp()]
+      }).catch(() => null);
+      if (!sent) continue;
+      await ticketStore.markFollowUp(ticket.id);
+      await logTicket(guild, new EmbedBuilder()
+        .setTitle("Ticket-Follow-up gesendet")
+        .setDescription(`<#${ticket.channelId}> wartet seit mehr als ${config.TICKET_FOLLOWUP_HOURS} Stunden auf eine Team-Antwort.`)
+        .addFields({ name: "Ticket", value: `#${ticketNumber(ticket.number)} ${ticket.subject}` })
+        .setColor(0xf1c40f)
+        .setTimestamp());
+    }
+  }
+}
+
+async function lockTicketChannel(ticket: Ticket, reason?: string) {
+  const guild = client.guilds.cache.get(ticket.guildId);
+  const channel = guild ? await guild.channels.fetch(ticket.channelId).catch(() => null) : null;
+  if (!channel) return;
+
+  const typedChannel = channel as unknown as {
+    setName?: (name: string, reason?: string) => Promise<unknown>;
+    permissionOverwrites?: {
+      edit: (id: string, options: Record<string, boolean>, reason?: string) => Promise<unknown>;
+    };
+  };
+
+  // A failure here means a "closed" ticket may still be writable by its owner, so
+  // surface it in the logs instead of swallowing it silently. We still don't throw:
+  // a partial lock should not abort the rest of the close flow (transcript, log).
+  const logLockFailure = (action: string) => (error: unknown) => {
+    console.error(`[ticket] lockTicketChannel: ${action} failed for ticket ${ticket.id}`, error);
+  };
+
+  await typedChannel.permissionOverwrites?.edit(ticket.ownerId, {
+    ViewChannel: true,
+    SendMessages: false,
+    ReadMessageHistory: true
+  }, reason).catch(logLockFailure("owner overwrite"));
+
+  for (const participantId of ticket.participants) {
+    await typedChannel.permissionOverwrites?.edit(participantId, {
+      ViewChannel: true,
+      SendMessages: false,
+      ReadMessageHistory: true
+    }, reason).catch(logLockFailure(`participant ${participantId} overwrite`));
+  }
+
+  await typedChannel.setName?.(`closed-${ticketNumber(ticket.number)}`, reason).catch(logLockFailure("rename"));
+}
+
+async function collectTicketMessages(ticket: Ticket, guild: Guild, limit = 1000) {
+  const channel = await guild.channels.fetch(ticket.channelId).catch(() => null);
+  if (channel?.type !== ChannelType.GuildText) return [];
+
+  const textChannel = channel as TextChannel;
+  const messages: Message[] = [];
+  let before: string | undefined;
+
+  for (;;) {
+    const batch = await textChannel.messages.fetch({ limit: 100, before }).catch(() => null);
+    if (!batch || batch.size === 0) break;
+    messages.push(...batch.values());
+    before = batch.last()?.id;
+    if (batch.size < 100 || messages.length >= limit) break;
+  }
+
+  return messages.sort((a, b) => a.createdTimestamp - b.createdTimestamp).slice(-limit);
+}
+
+function formatTicketMessagesForAi(messages: Message[]) {
+  return messages.map((message) => {
+    const content = message.content || "[kein Textinhalt]";
+    const attachments = message.attachments.size
+      ? ` | Anhaenge: ${[...message.attachments.values()].map((attachment) => attachment.name ?? "Datei").join(", ")}`
+      : "";
+    return `[${message.createdAt.toISOString()}] ${message.author.tag}: ${content}${attachments}`;
+  }).join("\n").slice(-12000);
+}
+
+async function createTicketTranscript(ticket: Ticket, guild: Guild) {
+  const sorted = await collectTicketMessages(ticket, guild, 1000);
+  if (!sorted.length) return undefined;
+  const category = getTicketCategory(ticket.category);
+  const lines = [
+    `Ticket ${ticketNumber(ticket.number)} - ${ticket.subject}`,
+    `Kategorie: ${category.label}`,
+    `Ersteller: ${ticket.ownerId}`,
+    `Kanal: ${ticket.channelId}`,
+    `Erstellt: ${ticket.createdAt}`,
+    "",
+    "Nachrichten:",
+    ""
+  ];
+
+  for (const message of sorted) {
+    const timestamp = message.createdAt.toISOString();
+    const author = `${message.author.tag} (${message.author.id})`;
+    const content = message.content || "[kein Textinhalt]";
+    lines.push(`[${timestamp}] ${author}: ${content}`);
+    if (message.attachments.size) {
+      for (const attachment of message.attachments.values()) {
+        lines.push(`  Anhang: ${attachment.name ?? "Datei"} ${attachment.url}`);
+      }
+    }
+  }
+
+  const filePath = join(config.BOT_DATA_DIR, "transcripts", `ticket-${ticketNumber(ticket.number)}.txt`);
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, `${lines.join("\n")}\n`, "utf8");
+  return filePath;
+}
+
+async function createTicketForUser(options: {
+  guild: Guild;
+  user: User;
+  categoryId: string;
+  subject: string;
+  description?: string;
+  reason?: string;
+  autoAnalyze?: boolean;
+  autoCategory?: boolean;
+}) {
+  let analysis: TicketAnalysis = {
+    categoryId: getTicketCategory(options.categoryId).id,
+    priority: "normal",
+    priorityReason: "Normale Support-Anfrage.",
+    missingInfoQuestions: [],
+    shortSummary: options.subject
+  };
+
+  if (options.autoAnalyze) {
+    try {
+      analysis = await analyzeTicketInput({
+        subject: options.subject,
+        description: options.description,
+        fallbackCategoryId: options.categoryId
+      });
+    } catch (error) {
+      await logErrorToDiscord({
+        guild: options.guild,
+        title: "Ticket AI-Analyse fehlgeschlagen",
+        error,
+        context: {
+          user: options.user.tag,
+          userId: options.user.id,
+          subject: options.subject
+        }
+      });
+    }
+  }
+
+  const ticketCategory = getTicketCategory(options.autoCategory ? analysis.categoryId : options.categoryId);
+  const category = await ensureTicketCategory(options.guild);
+  const number = await ticketStore.nextNumber(options.guild.id);
+  const channelName = `${ticketCategory.channelPrefix}-${ticketNumber(number)}-${slugify(options.user.username)}`;
+  const channel = await options.guild.channels.create({
+    name: channelName,
+    type: ChannelType.GuildText,
+    parent: category.id,
+    topic: `Ticket ${ticketNumber(number)} (${ticketCategory.label}) von ${options.user.tag}: ${options.subject}`,
+    permissionOverwrites: ticketPermissionOverwrites(options.guild, options.user.id),
+    reason: options.reason || `Ticket ${ticketNumber(number)} created by ${options.user.tag}`
+  });
+
+  const ticket = await ticketStore.create({
+    number,
+    guildId: options.guild.id,
+    channelId: channel.id,
+    ownerId: options.user.id,
+    category: ticketCategory.id,
+    priority: analysis.priority,
+    priorityReason: analysis.priorityReason,
+    aiSummary: analysis.shortSummary,
+    missingInfoQuestions: analysis.missingInfoQuestions,
+    subject: options.subject,
+    description: options.description
+  });
+
+  const teamMentions = ticketTeamRoleIds(options.guild).map((roleId) => `<@&${roleId}>`).join(" ");
+  await channel.send({
+    content: `<@${options.user.id}> ${teamMentions}`.trim(),
+    embeds: [new EmbedBuilder()
+      .setTitle(`Ticket ${ticketNumber(ticket.number)}: ${options.subject}`)
+      .setDescription(options.description || "Bitte beschreibe dein Anliegen hier im Ticket.")
+      .addFields(
+        { name: "Kategorie", value: ticketCategory.label, inline: true },
+        { name: "Prioritaet", value: priorityLabel(ticket.priority), inline: true },
+        { name: "User", value: `<@${options.user.id}>`, inline: true },
+        { name: "Status", value: "Offen", inline: true }
+      )
+      .setColor(priorityColor(ticket.priority))
+      .setTimestamp()]
+  });
+
+  if (analysis.missingInfoQuestions.length) {
+    await channel.send({
+      content: `<@${options.user.id}>`,
+      embeds: [new EmbedBuilder()
+        .setTitle("Kurze Rueckfragen")
+        .setDescription([
+          "Damit das Team schneller helfen kann, fehlen noch ein paar Infos:",
+          "",
+          ...analysis.missingInfoQuestions.map((question, index) => `${index + 1}. ${question}`)
+        ].join("\n"))
+        .setColor(0xf1c40f)]
+    }).catch(() => undefined);
+  }
+
+  await logTicket(options.guild, new EmbedBuilder()
+    .setTitle("Ticket erstellt")
+    .setDescription(`<@${options.user.id}> hat <#${channel.id}> erstellt.`)
+    .addFields(
+      { name: "Kategorie", value: ticketCategory.label, inline: true },
+      { name: "Prioritaet", value: priorityLabel(ticket.priority), inline: true },
+      { name: "Thema", value: options.subject, inline: true },
+      { name: "AI-Hinweis", value: analysis.priorityReason || "Keine Angabe" }
+    )
+    .setColor(priorityColor(ticket.priority))
+    .setTimestamp());
+
+  return { ticket, channel };
+}
+
+async function handleTicketCreateButton(interaction: ButtonInteraction) {
+  if (!interaction.guild || !interaction.channelId) return;
+
+  if (!(await isTicketEntryChannel(interaction.guild, interaction.channelId))) {
+    const entryChannel = await findTicketEntryChannel(interaction.guild);
+    await interaction.reply({
+      ephemeral: true,
+      content: entryChannel
+        ? `Bitte oeffne Tickets nur in <#${entryChannel.id}>.`
+        : "Der Ticket-Eingangskanal wurde nicht gefunden."
+    });
+    return;
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(TICKET_CREATE_MODAL_ID)
+    .setTitle("Support-Ticket oeffnen")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId(TICKET_MODAL_SUBJECT_ID)
+          .setLabel("Worum geht es?")
+          .setPlaceholder("z.B. Login funktioniert nicht")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(80)
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId(TICKET_MODAL_DESCRIPTION_ID)
+          .setLabel("Beschreibe dein Anliegen")
+          .setPlaceholder("Geraet, App, Fehlermeldung, Jellyfin-Name ...")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(false)
+          .setMaxLength(1000)
+      )
+    );
+
+  await interaction.showModal(modal);
+}
+
+async function handleTicketCreateModal(interaction: ModalSubmitInteraction) {
+  if (!interaction.guild || !interaction.channelId) return;
+
+  if (!(await isTicketEntryChannel(interaction.guild, interaction.channelId))) {
+    const entryChannel = await findTicketEntryChannel(interaction.guild);
+    await interaction.reply({
+      ephemeral: true,
+      content: entryChannel
+        ? `Bitte oeffne Tickets nur in <#${entryChannel.id}>.`
+        : "Der Ticket-Eingangskanal wurde nicht gefunden."
+    });
+    return;
+  }
+
+  const subject = (interaction.fields.getTextInputValue(TICKET_MODAL_SUBJECT_ID).trim() || "Support-Anfrage").slice(0, 80);
+  const rawDescription = interaction.fields.getTextInputValue(TICKET_MODAL_DESCRIPTION_ID).trim();
+  const category = inferTicketCategory(`${subject}\n${rawDescription}`);
+  await interaction.deferReply({ ephemeral: true });
+
+  const outcome = await createTicketWithLimit(interaction.guild, interaction.user.id, {
+    guild: interaction.guild,
+    user: interaction.user,
+    categoryId: category.id,
+    subject,
+    description: rawDescription || undefined,
+    reason: `Ticket created by button panel from ${interaction.user.tag}`,
+    autoAnalyze: true,
+    autoCategory: true
+  });
+  if (outcome.limited) {
+    await interaction.editReply(`Du hast bereits ein offenes Ticket: <#${outcome.existing.channelId}>`);
+    return;
+  }
+
+  await interaction.editReply(`Ticket erstellt: <#${outcome.result.channel.id}>`);
+}
+
+async function handleLibraryScanButton(interaction: ButtonInteraction) {
+  if (!interaction.guild) return;
+
+  const member = interaction.member instanceof GuildMember
+    ? interaction.member
+    : await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  if (!member || !isTicketTeamMember(member)) {
+    await interaction.reply({ ephemeral: true, content: "Nur das Team kann einen Bibliotheksscan starten." });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  await refreshJellyfinLibrary();
+  await interaction.editReply("Jellyfin-Bibliotheksscan wurde gestartet.");
+  await logToDiscord(interaction.guild, new EmbedBuilder()
+    .setTitle("Jellyfin-Bibliotheksscan gestartet")
+    .setDescription(`<@${interaction.user.id}> hat den Scan per Bot-Button gestartet.`)
+    .setColor(0x3498db)
+    .setTimestamp());
+}
+
+function suggestionComponents(id: string) {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${AI_SUGGEST_SEND_PREFIX}${id}`)
+        .setLabel("Antwort senden")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${AI_SUGGEST_DISCARD_PREFIX}${id}`)
+        .setLabel("Verwerfen")
+        .setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+
+function faqDraftComponents(id: string) {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${AI_FAQ_APPROVE_PREFIX}${id}`)
+        .setLabel("FAQ uebernehmen")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${AI_FAQ_DISCARD_PREFIX}${id}`)
+        .setLabel("Verwerfen")
+        .setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+
+async function handleSendSuggestionButton(interaction: ButtonInteraction, id: string) {
+  if (!interaction.guild) return;
+  const member = interaction.member instanceof GuildMember
+    ? interaction.member
+    : await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  if (!member || !isTicketTeamMember(member)) {
+    await interaction.reply({ ephemeral: true, content: "Nur das Team kann Antwortvorschlaege senden." });
+    return;
+  }
+
+  const suggestion = pendingReplySuggestions.get(id);
+  if (!suggestion) {
+    await interaction.reply({ ephemeral: true, content: "Dieser Vorschlag ist nicht mehr verfuegbar." });
+    return;
+  }
+
+  const channel = await interaction.guild.channels.fetch(suggestion.channelId).catch(() => null);
+  if (!canSend(channel)) {
+    await interaction.reply({ ephemeral: true, content: "Ticket-Kanal nicht gefunden oder nicht beschreibbar." });
+    return;
+  }
+
+  await channel.send({ content: suggestion.text });
+  pendingReplySuggestions.delete(id);
+  await interaction.update({
+    content: "Antwortvorschlag wurde gesendet.",
+    embeds: [],
+    components: []
+  });
+}
+
+async function handleDiscardSuggestionButton(interaction: ButtonInteraction, id: string) {
+  pendingReplySuggestions.delete(id);
+  await interaction.update({
+    content: "Antwortvorschlag wurde verworfen.",
+    embeds: [],
+    components: []
+  });
+}
+
+async function handleApproveFaqButton(interaction: ButtonInteraction, id: string) {
+  if (!interaction.guild) return;
+  const member = interaction.member instanceof GuildMember
+    ? interaction.member
+    : await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  if (!member || !isTicketTeamMember(member)) {
+    await interaction.reply({ ephemeral: true, content: "Nur das Team kann FAQ-Entwuerfe uebernehmen." });
+    return;
+  }
+
+  const pending = pendingFaqDrafts.get(id);
+  if (!pending || !pending.draft.title || !pending.draft.answer) {
+    await interaction.reply({ ephemeral: true, content: "Dieser FAQ-Entwurf ist nicht mehr verfuegbar." });
+    return;
+  }
+
+  const stored = await faqStore.add({
+    title: pending.draft.title,
+    keywords: pending.draft.keywords,
+    answer: pending.draft.answer,
+    approvedBy: interaction.user.id,
+    sourceTicketId: pending.ticketId
+  });
+  pendingFaqDrafts.delete(id);
+  await interaction.update({
+    embeds: [new EmbedBuilder()
+      .setTitle("FAQ uebernommen")
+      .setDescription(`Der Eintrag **${stored.title}** ist jetzt in der dynamischen FAQ verfuegbar.`)
+      .setColor(0x2ecc71)
+      .setTimestamp()],
+    components: []
+  });
+}
+
+async function handleDiscardFaqButton(interaction: ButtonInteraction, id: string) {
+  pendingFaqDrafts.delete(id);
+  await interaction.update({
+    embeds: [new EmbedBuilder()
+      .setTitle("FAQ-Entwurf verworfen")
+      .setColor(0x95a5a6)
+      .setTimestamp()],
+    components: []
+  });
+}
+
+async function ticketAiMessages(ticket: Ticket, guild: Guild) {
+  const messages = await collectTicketMessages(ticket, guild, 80);
+  return formatTicketMessagesForAi(messages);
+}
+
+async function handleTicketSummaryCommand(interaction: ChatInputCommandInteraction, ticket: Ticket) {
+  if (!interaction.guild) return;
+  const member = await getInteractionMember(interaction);
+  if (!member || !isTicketTeamMember(member)) {
+    await interaction.reply({ ephemeral: true, content: "Nur das Team kann Ticket-Zusammenfassungen erstellen." });
+    return;
+  }
+  if (!isOpenAiAssistantReady()) {
+    await interaction.reply({ ephemeral: true, content: "Der AI-Assistent ist noch nicht aktiviert." });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  const category = getTicketCategory(ticket.category);
+  const summary = await generateTicketSummary({
+    subject: ticket.subject,
+    categoryLabel: category.label,
+    priority: ticket.priority,
+    messages: await ticketAiMessages(ticket, interaction.guild)
+  });
+  await interaction.editReply({
+    embeds: [new EmbedBuilder()
+      .setTitle(`Zusammenfassung Ticket ${ticketNumber(ticket.number)}`)
+      .setDescription(summary)
+      .addFields(
+        { name: "Kategorie", value: category.label, inline: true },
+        { name: "Prioritaet", value: priorityLabel(ticket.priority), inline: true }
+      )
+      .setColor(priorityColor(ticket.priority))
+      .setTimestamp()]
+  });
+}
+
+async function handleTicketSuggestCommand(interaction: ChatInputCommandInteraction, ticket: Ticket) {
+  if (!interaction.guild) return;
+  const member = await getInteractionMember(interaction);
+  if (!member || !isTicketTeamMember(member)) {
+    await interaction.reply({ ephemeral: true, content: "Nur das Team kann Antwortvorschlaege erstellen." });
+    return;
+  }
+  if (!isOpenAiAssistantReady()) {
+    await interaction.reply({ ephemeral: true, content: "Der AI-Assistent ist noch nicht aktiviert." });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  const category = getTicketCategory(ticket.category);
+  const suggestion = await generateReplySuggestion({
+    subject: ticket.subject,
+    categoryLabel: category.label,
+    priority: ticket.priority,
+    messages: await ticketAiMessages(ticket, interaction.guild)
+  });
+  const id = randomUUID().slice(0, 10);
+  pendingReplySuggestions.set(id, {
+    channelId: ticket.channelId,
+    ticketId: ticket.id,
+    text: suggestion,
+    createdBy: interaction.user.id,
+    createdAt: Date.now()
+  });
+
+  await interaction.editReply({
+    embeds: [new EmbedBuilder()
+      .setTitle(`Antwortvorschlag Ticket ${ticketNumber(ticket.number)}`)
+      .setDescription(suggestion)
+      .setColor(0x3498db)
+      .setFooter({ text: "Wird erst gesendet, wenn du auf Antwort senden klickst." })
+      .setTimestamp()],
+    components: suggestionComponents(id)
+  });
+}
+
+async function createFaqDraftForClosedTicket(guild: Guild, ticket: Ticket) {
+  if (!isOpenAiAssistantReady()) return;
+
+  try {
+    const category = getTicketCategory(ticket.category);
+    const draft = await generateFaqDraft({
+      subject: ticket.subject,
+      categoryLabel: category.label,
+      messages: await ticketAiMessages(ticket, guild)
+    });
+    if (!draft.title || !draft.answer) return;
+
+    const id = randomUUID().slice(0, 10);
+    pendingFaqDrafts.set(id, { draft, ticketId: ticket.id, createdAt: Date.now() });
+    await sendTicketLogPayload(guild, {
+      embeds: [new EmbedBuilder()
+        .setTitle("FAQ-Entwurf aus geschlossenem Ticket")
+        .setDescription(draft.answer)
+        .addFields(
+          { name: "Titel", value: draft.title },
+          { name: "Keywords", value: draft.keywords.length ? draft.keywords.join(", ") : "Keine" },
+          { name: "Quelle", value: `<#${ticket.channelId}>`, inline: true }
+        )
+        .setColor(0x9b59b6)
+        .setFooter({ text: "Erst nach Freigabe wird dieser Eintrag gespeichert." })
+        .setTimestamp()],
+      components: faqDraftComponents(id)
+    });
+  } catch (error) {
+    await logErrorToDiscord({
+      guild,
+      title: "FAQ-Entwurf fehlgeschlagen",
+      error,
+      context: {
+        ticket: ticket.id,
+        subject: ticket.subject
+      }
+    });
+  }
+}
+
+async function handleTicketCommand(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+
+  const subcommand = interaction.options.getSubcommand();
+  const member = await getInteractionMember(interaction);
+
+  if (subcommand === "create") {
+    if (!(await isTicketEntryChannel(interaction.guild, interaction.channelId))) {
+      const entryChannel = await findTicketEntryChannel(interaction.guild);
+      await interaction.reply({
+        ephemeral: true,
+        content: entryChannel
+          ? `Bitte oeffne Tickets nur in <#${entryChannel.id}>.`
+          : "Der Ticket-Eingangskanal wurde nicht gefunden."
+      });
+      return;
+    }
+
+    const ticketCategory = getTicketCategory(interaction.options.getString("kategorie") ?? "sonstiges");
+    const subject = interaction.options.getString("thema", true).trim();
+    const description = interaction.options.getString("beschreibung")?.trim();
+    await interaction.deferReply({ ephemeral: true });
+
+    const outcome = await createTicketWithLimit(interaction.guild, interaction.user.id, {
+      guild: interaction.guild,
+      user: interaction.user,
+      categoryId: ticketCategory.id,
+      subject,
+      description,
+      reason: `Ticket created by slash command from ${interaction.user.tag}`,
+      autoAnalyze: true,
+      autoCategory: false
+    });
+    if (outcome.limited) {
+      await interaction.editReply(`Du hast bereits ein offenes Ticket: <#${outcome.existing.channelId}>`);
+      return;
+    }
+
+    await interaction.editReply(`Ticket erstellt: <#${outcome.result.channel.id}>`);
+    return;
+  }
+
+  if (subcommand === "list") {
+    if (!member || !isTicketTeamMember(member)) {
+      await interaction.reply({ ephemeral: true, content: "Nur das Team kann offene Tickets auflisten." });
+      return;
+    }
+
+    const tickets = await ticketStore.listOpen(interaction.guild.id);
+    const lines = tickets.slice(0, 20).map((ticket) =>
+      `#${ticketNumber(ticket.number)} <#${ticket.channelId}> von <@${ticket.ownerId}> - ${ticket.subject}`
+    );
+    await interaction.reply({
+      ephemeral: true,
+      content: lines.length ? lines.join("\n") : "Es gibt keine offenen Tickets."
+    });
+    return;
+  }
+
+  const ticket = await ticketStore.getByChannel(interaction.guild.id, interaction.channelId);
+  if (!ticket || ticket.status !== "open") {
+    await interaction.reply({ ephemeral: true, content: "Dieser Befehl funktioniert nur in einem offenen Ticket-Kanal." });
+    return;
+  }
+
+  if (subcommand === "summary") {
+    await handleTicketSummaryCommand(interaction, ticket);
+    return;
+  }
+
+  if (subcommand === "suggest") {
+    await handleTicketSuggestCommand(interaction, ticket);
+    return;
+  }
+
+  if (subcommand === "close") {
+    if (ticket.ownerId !== interaction.user.id && (!member || !isTicketTeamMember(member))) {
+      await interaction.reply({ ephemeral: true, content: "Nur der Ticket-Ersteller oder das Team kann dieses Ticket schliessen." });
+      return;
+    }
+
+    const reason = interaction.options.getString("grund")?.trim();
+    await interaction.deferReply();
+    const transcriptPath = await createTicketTranscript(ticket, interaction.guild).catch(() => undefined);
+    const closed = await ticketStore.close(ticket.id, interaction.user.id, reason, transcriptPath);
+    if (!closed) {
+      await interaction.editReply("Ticket konnte nicht gefunden werden.");
+      return;
+    }
+
+    await lockTicketChannel(closed, reason || "Ticket geschlossen");
+    if (canSend(interaction.channel)) {
+      await interaction.channel.send({
+        embeds: [new EmbedBuilder()
+          .setTitle(`Ticket ${ticketNumber(closed.number)} geschlossen`)
+          .setDescription(reason || "Kein Grund angegeben.")
+          .addFields({ name: "Geschlossen von", value: `<@${interaction.user.id}>`, inline: true })
+          .setColor(0xe74c3c)
+          .setTimestamp()]
+      }).catch(() => undefined);
+    }
+
+    await logTicketWithTranscript(interaction.guild, new EmbedBuilder()
+      .setTitle("Ticket geschlossen")
+      .setDescription(`<#${closed.channelId}> wurde von <@${interaction.user.id}> geschlossen.`)
+      .addFields(
+        { name: "Grund", value: reason || "Kein Grund angegeben." },
+        { name: "Transkript", value: transcriptPath ? "Wurde angehaengt und lokal gespeichert." : "Konnte nicht erstellt werden." }
+      )
+      .setColor(0xe74c3c)
+      .setTimestamp(), transcriptPath);
+
+    await createFaqDraftForClosedTicket(interaction.guild, closed);
+
+    await interaction.editReply("Ticket geschlossen.");
+    return;
+  }
+
+  if (!member || !isTicketTeamMember(member)) {
+    await interaction.reply({ ephemeral: true, content: "Nur das Team kann Teilnehmer in Tickets verwalten." });
+    return;
+  }
+
+  const user = interaction.options.getUser("user", true);
+  const channel = await interaction.guild.channels.fetch(ticket.channelId).catch(() => null);
+  const editableChannel = channel as unknown as {
+    permissionOverwrites?: {
+      edit: (id: string, options: Record<string, boolean>, reason?: string) => Promise<unknown>;
+      delete: (id: string, reason?: string) => Promise<unknown>;
+    };
+  };
+
+  if (subcommand === "add") {
+    await ticketStore.addParticipant(ticket.id, user.id);
+    await editableChannel.permissionOverwrites?.edit(user.id, {
+      ViewChannel: true,
+      SendMessages: true,
+      ReadMessageHistory: true,
+      UseApplicationCommands: true
+    }, "Ticket participant added");
+    await interaction.reply({ content: `<@${user.id}> wurde zum Ticket hinzugefuegt.` });
+    return;
+  }
+
+  if (subcommand === "remove") {
+    if (user.id === ticket.ownerId) {
+      await interaction.reply({ ephemeral: true, content: "Der Ticket-Ersteller kann nicht entfernt werden." });
+      return;
+    }
+    await ticketStore.removeParticipant(ticket.id, user.id);
+    await editableChannel.permissionOverwrites?.delete(user.id, "Ticket participant removed");
+    await interaction.reply({ content: `<@${user.id}> wurde aus dem Ticket entfernt.` });
+  }
+}
+
+async function handleTicketEntryMessage(message: Message) {
+  if (!config.ENABLE_SUPPORT_MESSAGE_TICKETS || !message.guild || message.author.bot) return false;
+  if (!(await isTicketEntryChannel(message.guild, message.channelId))) return false;
+
+  const member = await message.guild.members.fetch(message.author.id).catch(() => null);
+  if (member && isTicketTeamMember(member)) return false;
+
+  const rawContent = message.content.trim();
+  const attachmentLines = message.attachments.size
+    ? [...message.attachments.values()].map((attachment) => `Anhang: ${attachment.name ?? "Datei"} ${attachment.url}`)
+    : [];
+  const descriptionParts = [
+    rawContent || "Diese Anfrage wurde automatisch aus einer Nachricht im Support-Eingang erstellt.",
+    ...attachmentLines
+  ];
+  const description = descriptionParts.join("\n").slice(0, 1200);
+  const subject = (rawContent.split(/\r?\n/)[0]?.trim() || "Support-Anfrage").slice(0, 80);
+  const category = inferTicketCategory(rawContent);
+
+  const outcome = await createTicketWithLimit(message.guild, message.author.id, {
+    guild: message.guild,
+    user: message.author,
+    categoryId: category.id,
+    subject,
+    description,
+    reason: `Ticket created from support entry message by ${message.author.tag}`,
+    autoAnalyze: true,
+    autoCategory: true
+  });
+  if (outcome.limited) {
+    await message.delete().catch(() => undefined);
+    await message.author.send(`Du hast bereits ein offenes Ticket: <#${outcome.existing.channelId}>`).catch(() => undefined);
+    return true;
+  }
+
+  await message.delete().catch(() => undefined);
+  await message.author.send(`Dein Support-Ticket wurde erstellt: <#${outcome.result.channel.id}>`).catch(() => undefined);
+  return true;
+}
+
+function warningSourceLabel(source: WarningEntry["source"]) {
+  return source === "auto" ? "Auto" : "Manuell";
+}
+
+function formatWarningLine(warning: WarningEntry) {
+  const status = warning.active ? "aktiv" : "entfernt";
+  const timestamp = `<t:${Math.floor(new Date(warning.createdAt).getTime() / 1000)}:d>`;
+  const reason = warning.reason.length > 80 ? `${warning.reason.slice(0, 77)}...` : warning.reason;
+  return `\`${warning.id}\` ${status} | ${timestamp} | ${warningSourceLabel(warning.source)} | ${reason}`;
+}
+
+async function handleSupportStatusCommand(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+
+  const subcommand = interaction.options.getSubcommand();
+  const member = await getInteractionMember(interaction);
+
+  if (subcommand === "set") {
+    if (!member || !isTicketTeamMember(member)) {
+      await interaction.reply({ ephemeral: true, content: "Nur das Team kann den Support-Status setzen." });
+      return;
+    }
+
+    const status = interaction.options.getString("status", true) as SupportStatus;
+    const fallbackMessage = status === "online"
+      ? "Support ist aktuell erreichbar."
+      : status === "busy"
+        ? "Support ist gerade beschaeftigt, antwortet aber spaeter."
+        : "Support ist aktuell offline.";
+    const message = interaction.options.getString("nachricht")?.trim() || fallbackMessage;
+    const state = await supportStore.set(status, message, interaction.user.id);
+
+    await interaction.reply({
+      embeds: [new EmbedBuilder()
+        .setTitle("Support-Status aktualisiert")
+        .setDescription(state.message)
+        .addFields(
+          { name: "Status", value: supportStatusLabel(state.status), inline: true },
+          { name: "Gesetzt von", value: `<@${interaction.user.id}>`, inline: true }
+        )
+        .setColor(supportStatusColor(state.status))
+        .setTimestamp()]
+    });
+    return;
+  }
+
+  const state = await supportStore.get();
+  const openTickets = await ticketStore.listOpen(interaction.guild.id);
+  await interaction.reply({
+    ephemeral: true,
+    embeds: [new EmbedBuilder()
+      .setTitle("Support-Status")
+      .setDescription(state.message)
+      .addFields(
+        { name: "Status", value: supportStatusLabel(state.status), inline: true },
+        { name: "Offene Tickets", value: String(openTickets.length), inline: true },
+        { name: "Aktualisiert", value: state.updatedAt ? `<t:${Math.floor(new Date(state.updatedAt).getTime() / 1000)}:R>` : "Noch nie", inline: true }
+      )
+      .setColor(supportStatusColor(state.status))
+      .setTimestamp()]
+  });
+}
+
+async function registerCommands() {
+  if (!config.AUTO_REGISTER_COMMANDS || !client.user) return;
+  const rest = new REST({ version: "10" }).setToken(config.DISCORD_TOKEN);
+
+  if (config.DISCORD_GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(client.user.id, config.DISCORD_GUILD_ID), { body: commands });
+    console.log(`Registered ${commands.length} guild commands.`);
+    return;
+  }
+
+  await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+  console.log(`Registered ${commands.length} global commands.`);
+}
+
+async function setupGuild(guild: Guild) {
+  const existingRoleNames = new Set(guild.roles.cache.map((role) => role.name.toLowerCase()));
+  const created: string[] = [];
+
+  if (!existingRoleNames.has("jellyfin mitglied")) {
+    await guild.roles.create({ name: "Jellyfin Mitglied", reason: "Jellyfin Discord bot setup" });
+    created.push("Rolle: Jellyfin Mitglied");
+  }
+  if (!existingRoleNames.has("support")) {
+    await guild.roles.create({ name: "Support", reason: "Jellyfin Discord bot setup" });
+    created.push("Rolle: Support");
+  }
+
+  const category = guild.channels.cache.find((channel) =>
+    channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === "jellyfin"
+  ) ?? await guild.channels.create({
+    name: "Jellyfin",
+    type: ChannelType.GuildCategory,
+    reason: "Jellyfin Discord bot setup"
+  });
+
+  const channelNames = new Set(guild.channels.cache.map((channel) => channel.name.toLowerCase()));
+  for (const name of ["welcome", "support", "status", "payments", "mod-log"]) {
+    if (channelNames.has(name)) continue;
+    await guild.channels.create({
+      name,
+      type: ChannelType.GuildText,
+      parent: category.id,
+      reason: "Jellyfin Discord bot setup"
+    });
+    created.push(`Kanal: #${name}`);
+  }
+
+  return created;
+}
+
+function pruneEphemeralState() {
+  const now = Date.now();
+  for (const [userId, messages] of recentMessages) {
+    const fresh = messages.filter((item) => now - item.at <= MODERATION_WINDOW_MS);
+    if (fresh.length) recentMessages.set(userId, fresh);
+    else recentMessages.delete(userId);
+  }
+  for (const [key, at] of moderationCooldowns) {
+    if (now - at > MODERATION_COOLDOWN_MS) moderationCooldowns.delete(key);
+  }
+  for (const [id, suggestion] of pendingReplySuggestions) {
+    if (now - suggestion.createdAt > PENDING_ACTION_TTL_MS) pendingReplySuggestions.delete(id);
+  }
+  for (const [id, draft] of pendingFaqDrafts) {
+    if (now - draft.createdAt > PENDING_ACTION_TTL_MS) pendingFaqDrafts.delete(id);
+  }
+}
+
+client.once(Events.ClientReady, async () => {
+  await store.load();
+  await ticketStore.load();
+  await supportStore.load();
+  await faqStore.load();
+  await registerCommands();
+  for (const guild of client.guilds.cache.values()) {
+    await ensureTicketEntryInstructions(guild).catch(() => undefined);
+  }
+  await checkTicketFollowUps().catch((error) => {
+    console.error("Ticket follow-up check failed", error);
+    void logErrorToDiscord({
+      title: "Ticket follow-up check failed",
+      error
+    });
+  });
+  setInterval(() => {
+    void checkTicketFollowUps().catch((error) => {
+      console.error("Ticket follow-up check failed", error);
+      void logErrorToDiscord({
+        title: "Ticket follow-up check failed",
+        error
+      });
+    });
+  }, config.TICKET_FOLLOWUP_CHECK_MINUTES * 60_000);
+  setInterval(pruneEphemeralState, EPHEMERAL_PRUNE_INTERVAL_MS);
+  console.log(`Discord bot online as ${client.user?.tag}.`);
+});
+
+client.on(Events.GuildMemberAdd, async (member) => {
+  if (!config.ENABLE_MEMBER_MONITORING && !config.ENABLE_NEW_ACCOUNT_PROTECTION) return;
+  await store.recordJoin(member.id);
+
+  if (config.ENABLE_MEMBER_MONITORING && config.DISCORD_MEMBER_ROLE_ID) {
+    await member.roles.add(config.DISCORD_MEMBER_ROLE_ID, "Auto role for new Discord member").catch(() => undefined);
+  }
+
+  const ageDays = accountAgeDays(member.user);
+  const newAccount = config.ENABLE_NEW_ACCOUNT_PROTECTION && ageDays < config.NEW_ACCOUNT_WARN_DAYS;
+  const strictNew = config.ENABLE_NEW_ACCOUNT_PROTECTION && ageDays < config.NEW_ACCOUNT_STRICT_DAYS;
+
+  if (strictNew && config.DISCORD_NEW_ACCOUNT_REVIEW_ROLE_ID) {
+    await member.roles.add(config.DISCORD_NEW_ACCOUNT_REVIEW_ROLE_ID, "Sehr neuer Account: Review-Rolle").catch(() => undefined);
+  }
+
+  let timeoutApplied = false;
+  if (strictNew && config.NEW_ACCOUNT_STRICT_TIMEOUT_MINUTES > 0 && member.moderatable) {
+    await member.timeout(
+      config.NEW_ACCOUNT_STRICT_TIMEOUT_MINUTES * 60_000,
+      `Sehr neuer Account (${ageDays} Tage)`
+    ).catch(() => undefined);
+    timeoutApplied = true;
+  }
+
+  await logToDiscord(member.guild, new EmbedBuilder()
+    .setTitle(newAccount ? "Neuer Account beigetreten" : "User beigetreten")
+    .setDescription(`${member.user.tag} (${member.id})`)
+    .addFields(
+      { name: "Account-Alter", value: `${ageDays} Tage`, inline: true },
+      { name: "Pruefung", value: strictNew ? "Streng" : newAccount ? "Beobachten" : "Normal", inline: true },
+      { name: "Aktion", value: timeoutApplied ? `Timeout ${config.NEW_ACCOUNT_STRICT_TIMEOUT_MINUTES} Minuten` : "Keine", inline: true }
+    )
+    .setColor(0x2ecc71)
+    .setTimestamp());
+});
+
+client.on(Events.GuildMemberRemove, async (member) => {
+  if (!config.ENABLE_MEMBER_MONITORING) return;
+  await store.recordLeave(member.id);
+  await logToDiscord(member.guild, new EmbedBuilder()
+    .setTitle("User verlassen")
+    .setDescription(`${member.user.tag} (${member.id})`)
+    .setColor(0xe67e22)
+    .setTimestamp());
+});
+
+async function handleMessageCreate(message: Message) {
+  if (!message.guild || message.author.bot) return;
+  await store.recordMessage(message.author.id, message.channel.id);
+  await recordTicketChannelActivity(message);
+
+  // Tickets and the support entry channel are exactly where users legitimately
+  // paste links, error text and account details, so auto-moderation must not run
+  // there. Entry-channel messages are turned into a ticket first.
+  const inTicketChannel = Boolean(await ticketStore.getByChannel(message.guild.id, message.channelId));
+  const inEntryChannel = await isTicketEntryChannel(message.guild, message.channelId);
+
+  if (inEntryChannel) {
+    if (await handleTicketEntryMessage(message)) return;
+  }
+
+  if (!inTicketChannel && !inEntryChannel) {
+    if (await handleInviteProtectionMessage(message)) return;
+    if (await handleScamPhraseMessage(message)) return;
+    if (await handleAdvancedAntiSpamMessage(message)) return;
+  }
+
+  if ((!config.ENABLE_MESSAGE_QA && !isOpenAiAssistantReady()) || !client.user) return;
+  const mentioned = message.mentions.users.has(client.user.id);
+  const prefixed = message.content.toLowerCase().startsWith("jellybot ");
+  if (!mentioned && !prefixed) return;
+
+  const question = stripBotMention(message.content);
+  const answer = await answerAnyQuestion(question);
+  if (answer) {
+    await message.reply(answer.answer);
+    return;
+  }
+
+  if (isOpenAiAssistantReady()) {
+    await sendTypingIfPossible(message.channel);
+    try {
+      if (await answerWithAiAssistant({
+        guild: message.guild,
+        channelId: message.channelId,
+        channelName: readableChannelName(message.channel),
+        user: message.author,
+        question,
+        reply: (payload) => message.reply(payload)
+      })) return;
+    } catch (error) {
+      console.error("AI assistant failed", error);
+      await logErrorToDiscord({
+        guild: message.guild,
+        title: "AI assistant failed",
+        error,
+        context: {
+          user: message.author.tag,
+          userId: message.author.id,
+          channelId: message.channelId
+        }
+      });
+      await message.reply("Der AI-Assistent ist gerade nicht erreichbar. Ich habe den Fehler im Bot-Log gespeichert.").catch(() => undefined);
+      return;
+    }
+  }
+
+  await message.reply(`Ich kenne diese Frage noch nicht. Themen: ${(await allFaqTopics()).join(", ")}`);
+}
+
+client.on(Events.MessageCreate, (message) => {
+  void handleMessageCreate(message).catch((error) => {
+    console.error("Message handler failed", error);
+    void logErrorToDiscord({
+      guild: message.guild,
+      title: "Message handler failed",
+      error,
+      context: {
+        user: message.author.tag,
+        userId: message.author.id,
+        channelId: message.channelId,
+        messageId: message.id
+      }
+    });
+  });
+});
+
+async function handleInteractionCreate(interaction: Interaction) {
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName === "faq") {
+      const focused = interaction.options.getFocused();
+      const choices = (await searchAllFaqItems(String(focused), 8)).map((item) => ({
+        name: item.title,
+        value: item.title
+      }));
+      await interaction.respond(choices);
+    }
+    return;
+  }
+
+  if (interaction.isButton()) {
+    if (interaction.customId === TICKET_CREATE_BUTTON_ID) {
+      await handleTicketCreateButton(interaction);
+    }
+    if (interaction.customId === AI_LIBRARY_SCAN_BUTTON_ID) {
+      await handleLibraryScanButton(interaction);
+    }
+    if (interaction.customId.startsWith(AI_SUGGEST_SEND_PREFIX)) {
+      await handleSendSuggestionButton(interaction, interaction.customId.slice(AI_SUGGEST_SEND_PREFIX.length));
+    }
+    if (interaction.customId.startsWith(AI_SUGGEST_DISCARD_PREFIX)) {
+      await handleDiscardSuggestionButton(interaction, interaction.customId.slice(AI_SUGGEST_DISCARD_PREFIX.length));
+    }
+    if (interaction.customId.startsWith(AI_FAQ_APPROVE_PREFIX)) {
+      await handleApproveFaqButton(interaction, interaction.customId.slice(AI_FAQ_APPROVE_PREFIX.length));
+    }
+    if (interaction.customId.startsWith(AI_FAQ_DISCARD_PREFIX)) {
+      await handleDiscardFaqButton(interaction, interaction.customId.slice(AI_FAQ_DISCARD_PREFIX.length));
+    }
+    return;
+  }
+
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId === TICKET_CREATE_MODAL_ID) {
+      await handleTicketCreateModal(interaction);
+    }
+    return;
+  }
+
+  if (!interaction.isChatInputCommand() || !interaction.guild) return;
+
+  if (interaction.commandName === "status") {
+    await interaction.deferReply();
+    const [portal, jellyfin, sessions] = await Promise.allSettled([
+      getPortalHealth(),
+      getJellyfinInfo(),
+      getActiveSessionCount()
+    ]);
+
+    const embed = new EmbedBuilder()
+      .setTitle("Jellyfin Status")
+      .setColor(0x3498db)
+      .addFields({
+        name: "Portal API",
+        value: portal.status === "fulfilled" && portal.value.ok ? `Online (${portal.value.shop ?? "Shop"})` : "Nicht erreichbar",
+        inline: true
+      }, {
+        name: "Jellyfin",
+        value: jellyfin.status === "fulfilled" && jellyfin.value.configured
+          ? `${jellyfin.value.info.ServerName ?? "Server"} ${jellyfin.value.info.Version ?? ""}`.trim()
+          : "Nicht konfiguriert oder nicht erreichbar",
+        inline: true
+      }, {
+        name: "Aktive Sessions",
+        value: sessions.status === "fulfilled" && sessions.value !== undefined ? String(sessions.value) : "API-Key fehlt",
+        inline: true
+      })
+      .setTimestamp();
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (interaction.commandName === "usercheck") {
+    const username = interaction.options.getString("username", true).trim();
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const result = await checkPortalUser(username);
+      await interaction.editReply(result.exists
+        ? `Der Jellyfin-Benutzer "${username}" wurde gefunden.`
+        : `Der Jellyfin-Benutzer "${username}" wurde nicht gefunden.`);
+    } catch (error) {
+      await logErrorToDiscord({
+        guild: interaction.guild,
+        title: "User-Check fehlgeschlagen",
+        error,
+        context: {
+          user: interaction.user.tag,
+          userId: interaction.user.id,
+          username
+        }
+      });
+      await interaction.editReply(`User-Check fehlgeschlagen: ${error instanceof Error ? error.message : "Unbekannter Fehler"}`);
+    }
+    return;
+  }
+
+  if (interaction.commandName === "faq") {
+    const question = interaction.options.getString("frage")?.trim();
+    if (!question) {
+      await interaction.reply({ ephemeral: true, content: `FAQ-Themen: ${(await allFaqTopics()).join(", ")}` });
+      return;
+    }
+    const answer = await answerAnyQuestion(question);
+    await interaction.reply({
+      ephemeral: true,
+      content: answer ? answer.answer : `Dazu habe ich noch keine passende Antwort. Themen: ${(await allFaqTopics()).join(", ")}`
+    });
+    return;
+  }
+
+  if (interaction.commandName === "payment-link") {
+    await interaction.reply({ ephemeral: true, content: `Zahlungsseite: ${paymentUrl()}` });
+    return;
+  }
+
+  if (interaction.commandName === "ask") {
+    const question = interaction.options.getString("frage", true).trim();
+    await interaction.deferReply();
+    if (!isOpenAiAssistantReady()) {
+      await interaction.editReply("Der AI-Assistent ist noch nicht aktiviert. Setze OPENAI_API_KEY und ENABLE_AI_ASSISTANT=true.");
+      return;
+    }
+
+    await answerWithAiAssistant({
+      guild: interaction.guild,
+      channelId: interaction.channelId,
+      channelName: readableChannelName(interaction.channel),
+      user: interaction.user,
+      question,
+      reply: (payload) => interaction.editReply(payload)
+    });
+    return;
+  }
+
+  if (interaction.commandName === "ticket") {
+    await handleTicketCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "support-status") {
+    await handleSupportStatusCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "stats") {
+    const target = interaction.options.getUser("user") ?? interaction.user;
+    const member = interaction.member instanceof GuildMember ? interaction.member : undefined;
+    if (target.id !== interaction.user.id && member && !isModerator(member)) {
+      await interaction.reply({ ephemeral: true, content: "Du kannst nur deine eigenen Stats ansehen." });
+      return;
+    }
+    const stats = await store.getUser(target.id);
+    await interaction.reply({
+      ephemeral: true,
+      content: [
+        `Stats fuer ${target.tag}`,
+        `Nachrichten: ${stats.messages}`,
+        `Warnungen: ${stats.warnings}`,
+        `Beitritte: ${stats.joins}`,
+        `Letzte Aktivitaet: ${stats.lastSeenAt ?? "nie"}`
+      ].join("\n")
+    });
+    return;
+  }
+
+  if (interaction.commandName === "warn") {
+    if (!(await ensureCommandPermission(interaction, isModerator))) return;
+    const targetUser = interaction.options.getUser("user", true);
+    const target = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+    const reason = interaction.options.getString("grund", true);
+    if (!(target instanceof GuildMember)) {
+      await interaction.reply({ ephemeral: true, content: "User nicht gefunden." });
+      return;
+    }
+    const result = await warnAndEscalate({
+      guild: interaction.guild,
+      member: target,
+      reason,
+      source: "manual",
+      moderatorId: interaction.user.id
+    });
+    await interaction.reply({
+      ephemeral: true,
+      content: [
+        `${target.user.tag} wurde verwarnt.`,
+        `Warnungen: ${result.total}`,
+        `ID: ${result.entry.id}`,
+        result.timeoutApplied ? `Eskalation: Timeout ${result.timeoutMinutes} Minuten` : "Eskalation: keine"
+      ].join("\n")
+    });
+    return;
+  }
+
+  if (interaction.commandName === "warnings") {
+    if (!(await ensureCommandPermission(interaction, isModerator))) return;
+    const target = interaction.options.getUser("user", true);
+    const includeInactive = interaction.options.getBoolean("inaktive") ?? false;
+    const warnings = await store.listWarnings(target.id, includeInactive);
+    const activeCount = (await store.getUser(target.id)).warnings;
+    const lines = warnings.slice(0, 10).map(formatWarningLine);
+    await interaction.reply({
+      ephemeral: true,
+      embeds: [new EmbedBuilder()
+        .setTitle(`Warnungen fuer ${target.tag}`)
+        .setDescription(lines.length ? lines.join("\n") : "Keine Warnungen gefunden.")
+        .addFields(
+          { name: "Aktiv", value: String(activeCount), inline: true },
+          { name: "Angezeigt", value: String(warnings.length), inline: true }
+        )
+        .setColor(activeCount > 0 ? 0xf1c40f : 0x2ecc71)
+        .setTimestamp()]
+    });
+    return;
+  }
+
+  if (interaction.commandName === "unwarn") {
+    if (!(await ensureCommandPermission(interaction, isModerator))) return;
+    const target = interaction.options.getUser("user", true);
+    const warningId = interaction.options.getString("id")?.trim();
+    const reason = interaction.options.getString("grund")?.trim();
+    const removed = await store.removeWarning(target.id, warningId, interaction.user.id, reason);
+    if (!removed) {
+      await interaction.reply({
+        ephemeral: true,
+        content: warningId
+          ? `Keine aktive Warnung mit ID ${warningId} gefunden.`
+          : "Dieser User hat keine aktive Warnung."
+      });
+      return;
+    }
+    await interaction.reply({
+      ephemeral: true,
+      content: `Warnung ${removed.entry.id} von ${target.tag} wurde entfernt. Aktive Warnungen: ${removed.total}`
+    });
+    await logToDiscord(interaction.guild, new EmbedBuilder()
+      .setTitle("Warnung entfernt")
+      .setDescription(`<@${target.id}>: Warnung ${removed.entry.id}`)
+      .addFields(
+        { name: "Entfernt von", value: `<@${interaction.user.id}>`, inline: true },
+        { name: "Aktive Warnungen", value: String(removed.total), inline: true },
+        { name: "Grund", value: reason || "Keine Angabe" }
+      )
+      .setColor(0x2ecc71)
+      .setTimestamp());
+    return;
+  }
+
+  if (interaction.commandName === "timeout") {
+    if (!(await ensureCommandPermission(interaction, isModerator))) return;
+    const targetUser = interaction.options.getUser("user", true);
+    const target = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+    const minutes = interaction.options.getInteger("minuten", true);
+    const reason = interaction.options.getString("grund") ?? "Moderation";
+    if (!(target instanceof GuildMember) || !target.moderatable) {
+      await interaction.reply({ ephemeral: true, content: "Ich kann diesen User nicht timeouten." });
+      return;
+    }
+    await target.timeout(minutes * 60_000, reason);
+    await interaction.reply({ ephemeral: true, content: `${target.user.tag} hat einen Timeout fuer ${minutes} Minuten erhalten.` });
+    await logToDiscord(interaction.guild, new EmbedBuilder()
+      .setTitle("Timeout")
+      .setDescription(`${target.user.tag}: ${reason}`)
+      .addFields({ name: "Dauer", value: `${minutes} Minuten`, inline: true })
+      .setColor(0xe74c3c)
+      .setTimestamp());
+    return;
+  }
+
+  if (interaction.commandName === "announce") {
+    if (!(await ensureCommandPermission(interaction, (member) => memberHasGuildPermission(member, PermissionFlagsBits.ManageMessages)))) return;
+    const channel = interaction.options.getChannel("kanal", true);
+    const text = interaction.options.getString("text", true);
+    const target = await interaction.guild.channels.fetch(channel.id);
+    if (!canSend(target)) {
+      await interaction.reply({ ephemeral: true, content: "Der Zielkanal muss ein Textkanal sein." });
+      return;
+    }
+    await target.send({ content: text });
+    await interaction.reply({ ephemeral: true, content: "Ankuendigung gesendet." });
+    return;
+  }
+
+  if (interaction.commandName === "setup") {
+    if (!(await ensureCommandPermission(interaction, (member) => memberHasGuildPermission(member, PermissionFlagsBits.ManageGuild)))) return;
+    await interaction.deferReply({ ephemeral: true });
+    const created = await setupGuild(interaction.guild);
+    await interaction.editReply(created.length ? `Erstellt:\n${created.join("\n")}` : "Alles war bereits vorhanden.");
+  }
+}
+
+client.on(Events.InteractionCreate, (interaction) => {
+  void handleInteractionCreate(interaction).catch(async (error) => {
+    console.error("Interaction handler failed", error);
+    await logErrorToDiscord({
+      guild: interaction.guild,
+      title: "Interaction handler failed",
+      error,
+      context: {
+        interactionType: interaction.type,
+        command: interaction.isChatInputCommand() ? interaction.commandName : undefined,
+        customId: "customId" in interaction ? interaction.customId : undefined,
+        user: interaction.user.tag,
+        userId: interaction.user.id,
+        channelId: interaction.channelId
+      }
+    });
+    if (!interaction.isRepliable()) return;
+
+    const content = "Dabei ist ein Fehler passiert. Ich habe ihn im Bot-Log gespeichert.";
+    if (interaction.deferred || interaction.replied) {
+      await interaction.followUp({ ephemeral: true, content }).catch(() => undefined);
+      return;
+    }
+
+    await interaction.reply({ ephemeral: true, content }).catch(() => undefined);
+  });
+});
+
+client.login(config.DISCORD_TOKEN);
