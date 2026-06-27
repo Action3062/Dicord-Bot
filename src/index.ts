@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
@@ -50,12 +50,15 @@ import { SupportStore, type SupportStatus } from "./support-store.js";
 import { getTicketCategory, inferTicketCategory } from "./ticket-categories.js";
 import { TicketStore, type Ticket } from "./ticket-store.js";
 import { StatsStore, type StatsChannelEntry, type StatsChannelKind } from "./stats-store.js";
+import { TrialStore } from "./trial-store.js";
+import { createTrialAccount, isJfaGoConfigured } from "./jfago.js";
 
 const store = ActivityStore.fromDataDir(config.BOT_DATA_DIR);
 const ticketStore = TicketStore.fromDataDir(config.BOT_DATA_DIR);
 const supportStore = SupportStore.fromDataDir(config.BOT_DATA_DIR);
 const faqStore = FaqStore.fromDataDir(config.BOT_DATA_DIR);
 const statsStore = StatsStore.fromDataDir(config.BOT_DATA_DIR);
+const trialStore = TrialStore.fromDataDir(config.BOT_DATA_DIR);
 type RecentUserMessage = {
   at: number;
   contentKey: string;
@@ -458,7 +461,7 @@ async function logToDiscord(guild: Guild, embed: EmbedBuilder) {
 
 function redactSensitive(value: string) {
   let redacted = value;
-  for (const secret of [config.DISCORD_TOKEN, config.OPENAI_API_KEY, config.JELLYFIN_API_KEY]) {
+  for (const secret of [config.DISCORD_TOKEN, config.OPENAI_API_KEY, config.JELLYFIN_API_KEY, config.JFA_GO_ADMIN_PASSWORD]) {
     if (secret) redacted = redacted.split(secret).join("[redacted]");
   }
 
@@ -2123,6 +2126,148 @@ async function handleStatsRemove(interaction: ChatInputCommandInteraction) {
   await interaction.editReply("Statistik-Kanaele entfernt.");
 }
 
+const TRIAL_ROLE_NAME = "Trial";
+const TRIAL_LOG_CHANNEL_NAME = "trial-log";
+
+function generateTrialUsername(user: User) {
+  const baseName = user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 16) || "user";
+  const suffix = randomUUID().replace(/-/g, "").slice(0, 4);
+  return `trial-${baseName}-${suffix}`;
+}
+
+function generateTrialPassword() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const bytes = randomBytes(20);
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
+async function resolveTrialRole(guild: Guild) {
+  if (config.DISCORD_TRIAL_ROLE_ID) {
+    const byId = guild.roles.cache.get(config.DISCORD_TRIAL_ROLE_ID)
+      ?? await guild.roles.fetch(config.DISCORD_TRIAL_ROLE_ID).catch(() => null);
+    if (byId) return byId;
+  }
+  const byName = guild.roles.cache.find((role) => role.name.toLowerCase() === TRIAL_ROLE_NAME.toLowerCase());
+  if (byName) return byName;
+  return guild.roles.create({ name: TRIAL_ROLE_NAME, reason: "Trial-Rolle (Setup)" }).catch(() => null);
+}
+
+async function resolveTrialLogChannel(guild: Guild) {
+  if (config.DISCORD_TRIAL_LOG_CHANNEL_ID) {
+    const configured = await guild.channels.fetch(config.DISCORD_TRIAL_LOG_CHANNEL_ID).catch(() => null);
+    if (configured) return configured;
+  }
+  return guild.channels.cache.find(
+    (channel) => channel.type === ChannelType.GuildText && channel.name.toLowerCase() === TRIAL_LOG_CHANNEL_NAME
+  ) ?? null;
+}
+
+async function logTrial(guild: Guild, embed: EmbedBuilder) {
+  const channel = await resolveTrialLogChannel(guild);
+  if (canSend(channel)) await channel.send({ embeds: [embed] }).catch(() => undefined);
+}
+
+async function handleTrialCommand(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+  if (!isJfaGoConfigured()) {
+    await interaction.reply({ ephemeral: true, content: "Der Testzugang ist gerade nicht verfuegbar (jfa-go ist nicht konfiguriert)." });
+    return;
+  }
+
+  const existing = await trialStore.get(interaction.guild.id, interaction.user.id);
+  if (existing) {
+    await interaction.reply({ ephemeral: true, content: "Du hast bereits einen Testzugang erhalten." });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const username = generateTrialUsername(interaction.user);
+  const password = generateTrialPassword();
+  const label = `discord-trial-${interaction.user.id}-${Date.now()}`;
+
+  try {
+    await createTrialAccount({ username, password, trialHours: config.TRIAL_HOURS, label });
+  } catch (error) {
+    await logErrorToDiscord({
+      guild: interaction.guild,
+      title: "Trial-Account konnte nicht erstellt werden",
+      error,
+      context: { user: interaction.user.tag, userId: interaction.user.id, username }
+    });
+    await interaction.editReply("Der Testzugang konnte nicht erstellt werden. Das Team wurde informiert.");
+    return;
+  }
+
+  const expiresAt = Date.now() + config.TRIAL_HOURS * 60 * 60_000;
+  const loginUrl = config.JELLYFIN_BASE_URL ? config.JELLYFIN_BASE_URL.replace(/\/+$/, "") : "(Jellyfin-URL)";
+  const expiryTag = `<t:${Math.floor(expiresAt / 1000)}:R>`;
+
+  const dm = [
+    "Dein Jellyfin-Testzugang ist bereit:",
+    `Login: ${loginUrl}`,
+    `Benutzername: \`${username}\``,
+    `Passwort: \`${password}\``,
+    `Der Zugang laeuft ${expiryTag} automatisch ab.`,
+    "Bitte aendere dein Passwort nach dem ersten Login."
+  ].join("\n");
+
+  let dmDelivered = true;
+  try {
+    await interaction.user.send(dm);
+  } catch {
+    dmDelivered = false;
+  }
+
+  let roleId: string | undefined;
+  const member = await getInteractionMember(interaction);
+  const role = await resolveTrialRole(interaction.guild);
+  if (member && role) {
+    roleId = role.id;
+    await member.roles.add(role, "Trial gestartet").catch(() => undefined);
+  }
+
+  await trialStore.set(interaction.guild.id, {
+    userId: interaction.user.id,
+    jellyfinUsername: username,
+    createdAt: new Date().toISOString(),
+    expiresAt,
+    roleId,
+    roleRemoved: false
+  });
+
+  await logTrial(interaction.guild, new EmbedBuilder()
+    .setTitle("Neuer Trial-Account")
+    .setDescription(`<@${interaction.user.id}> hat einen Testzugang erstellt.`)
+    .addFields(
+      { name: "Jellyfin-Benutzer", value: username, inline: true },
+      { name: "Laeuft ab", value: expiryTag, inline: true },
+      { name: "DM zugestellt", value: dmDelivered ? "ja" : "nein", inline: true }
+    )
+    .setColor(0x9b59b6)
+    .setTimestamp());
+
+  await interaction.editReply(dmDelivered
+    ? "Dein Testzugang wurde erstellt - die Zugangsdaten findest du in deinen DMs."
+    : `Dein Testzugang wurde erstellt, aber ich konnte dir keine DM schicken. Hier deine Daten:\nBenutzername: \`${username}\`\nPasswort: \`${password}\`\nLogin: ${loginUrl}`);
+}
+
+async function expireTrials() {
+  const now = Date.now();
+  for (const { guildId, entry } of await trialStore.activeEntries()) {
+    if (entry.expiresAt > now) continue;
+    const guild = client.guilds.cache.get(guildId);
+    if (guild && entry.roleId) {
+      const roleId = entry.roleId;
+      const member = await guild.members.fetch(entry.userId).catch(() => null);
+      if (member) await member.roles.remove(roleId, "Trial abgelaufen").catch(() => undefined);
+    }
+    await trialStore.set(guildId, { ...entry, roleRemoved: true });
+  }
+}
+
 function pruneEphemeralState() {
   const now = Date.now();
   for (const [userId, messages] of recentMessages) {
@@ -2147,6 +2292,7 @@ client.once(Events.ClientReady, async () => {
   await supportStore.load();
   await faqStore.load();
   await statsStore.load();
+  await trialStore.load();
   await registerCommands();
   for (const guild of client.guilds.cache.values()) {
     await ensureTicketEntryInstructions(guild).catch(() => undefined);
@@ -2172,6 +2318,10 @@ client.once(Events.ClientReady, async () => {
     void updateAllStats();
   }, Math.max(10, config.STATS_REFRESH_MINUTES) * 60_000);
   void updateAllStats();
+  setInterval(() => {
+    void expireTrials().catch((error) => console.error("[trial] expire failed", error));
+  }, 5 * 60_000);
+  void expireTrials();
   console.log(`Discord bot online as ${client.user?.tag}.`);
 });
 
@@ -2418,6 +2568,11 @@ async function handleInteractionCreate(interaction: Interaction) {
 
   if (interaction.commandName === "payment-link") {
     await interaction.reply({ ephemeral: true, content: `Zahlungsseite: ${paymentUrl()}` });
+    return;
+  }
+
+  if (interaction.commandName === "trial") {
+    await handleTrialCommand(interaction);
     return;
   }
 

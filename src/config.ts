@@ -51,7 +51,14 @@ const schema = z.object({
   TICKET_FOLLOWUP_HOURS: z.preprocess((value) => optionalNumber(value, 24), z.number().int().positive()),
   TICKET_FOLLOWUP_CHECK_MINUTES: z.preprocess((value) => optionalNumber(value, 30), z.number().int().positive()),
   MAX_OPEN_TICKETS_PER_USER: z.preprocess((value) => optionalNumber(value, 1), z.number().int().positive()),
-  STATS_REFRESH_MINUTES: z.preprocess((value) => optionalNumber(value, 15), z.number().int().positive())
+  STATS_REFRESH_MINUTES: z.preprocess((value) => optionalNumber(value, 15), z.number().int().positive()),
+  JFA_GO_BASE_URL: z.string().default(""),
+  JFA_GO_ADMIN_USER: z.string().default(""),
+  JFA_GO_ADMIN_PASSWORD: z.string().default(""),
+  JFA_GO_PROFILE: z.string().default(""),
+  TRIAL_HOURS: z.preprocess((value) => optionalNumber(value, 26), z.number().int().positive()),
+  DISCORD_TRIAL_ROLE_ID: z.string().default(""),
+  DISCORD_TRIAL_LOG_CHANNEL_ID: z.string().default("")
 });
 
 export const config = schema.parse(process.env);

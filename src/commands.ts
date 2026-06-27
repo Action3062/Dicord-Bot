@@ -135,6 +135,9 @@ export const commandBuilders = [
       .setName("remove")
       .setDescription("Entfernt die Statistik-Kanaele wieder.")),
   new SlashCommandBuilder()
+    .setName("trial")
+    .setDescription("Erstellt dir einen zeitlich begrenzten Jellyfin-Testzugang."),
+  new SlashCommandBuilder()
     .setName("warn")
     .setDescription("Verwarnt einen User und schreibt es ins Log.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
