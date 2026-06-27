@@ -2129,18 +2129,20 @@ async function handleStatsRemove(interaction: ChatInputCommandInteraction) {
 const TRIAL_ROLE_NAME = "Trial";
 const TRIAL_LOG_CHANNEL_NAME = "trial-log";
 
-function generateTrialUsername(user: User) {
-  const baseName = user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 16) || "user";
-  const suffix = randomUUID().replace(/-/g, "").slice(0, 4);
-  return `trial-${baseName}-${suffix}`;
+function randomFromAlphabet(length: number, alphabet: string) {
+  const bytes = randomBytes(length);
+  let out = "";
+  for (let i = 0; i < length; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
+function generateTrialUsername() {
+  // 8 random characters: lowercase letters + digits (ambiguous chars 0/o/1/l removed).
+  return randomFromAlphabet(8, "abcdefghijkmnpqrstuvwxyz23456789");
 }
 
 function generateTrialPassword() {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
-  const bytes = randomBytes(20);
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) out += alphabet[bytes[i] % alphabet.length];
-  return out;
+  return randomFromAlphabet(20, "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789");
 }
 
 async function resolveTrialRole(guild: Guild) {
@@ -2184,7 +2186,7 @@ async function handleTrialCommand(interaction: ChatInputCommandInteraction) {
 
   await interaction.deferReply({ ephemeral: true });
 
-  const username = generateTrialUsername(interaction.user);
+  const username = generateTrialUsername();
   const password = generateTrialPassword();
   const label = `discord-trial-${interaction.user.id}-${Date.now()}`;
 
