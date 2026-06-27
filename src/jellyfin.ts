@@ -115,3 +115,90 @@ export async function refreshJellyfinLibrary() {
   });
   if (!response.ok) throw new Error(`Bibliotheksscan fehlgeschlagen: ${response.status} ${response.statusText}`);
 }
+
+// --- Library statistics (for the Discord stat voice-channels) ---
+
+type JellyfinVirtualFolder = {
+  Name?: string;
+  ItemId?: string;
+  CollectionType?: string;
+};
+
+type JellyfinItemCounts = {
+  MovieCount?: number;
+  SeriesCount?: number;
+  EpisodeCount?: number;
+};
+
+export type LibraryStat = {
+  id: string;
+  name: string;
+  collectionType?: string;
+  count: number;
+};
+
+export type JellyfinLibraryStats = {
+  configured: boolean;
+  totals: { movies?: number; series?: number; episodes?: number };
+  libraries: LibraryStat[];
+};
+
+function includeTypesForCollection(collectionType?: string) {
+  switch (collectionType) {
+    case "movies":
+      return "Movie";
+    case "tvshows":
+      return "Series";
+    case "music":
+      return "MusicAlbum";
+    case "books":
+      return "Book";
+    case "musicvideos":
+      return "MusicVideo";
+    default:
+      return undefined;
+  }
+}
+
+export async function getJellyfinLibraryStats(): Promise<JellyfinLibraryStats> {
+  if (!config.JELLYFIN_BASE_URL || !config.JELLYFIN_API_KEY) {
+    return { configured: false, totals: {}, libraries: [] };
+  }
+
+  const base = trimTrailingSlash(config.JELLYFIN_BASE_URL);
+  const headers = { "X-Emby-Token": config.JELLYFIN_API_KEY };
+
+  const folders = await fetchJson<JellyfinVirtualFolder[]>(`${base}/Library/VirtualFolders`, { headers });
+
+  const libraries: LibraryStat[] = [];
+  for (const folder of folders) {
+    if (!folder.ItemId || !folder.Name) continue;
+    const params = new URLSearchParams({
+      ParentId: folder.ItemId,
+      Recursive: "true",
+      Limit: "0",
+      EnableTotalRecordCount: "true"
+    });
+    const includeTypes = includeTypesForCollection(folder.CollectionType);
+    if (includeTypes) params.set("IncludeItemTypes", includeTypes);
+    const result = await fetchJson<JellyfinItemsResponse>(`${base}/Items?${params}`, { headers });
+    libraries.push({
+      id: folder.ItemId,
+      name: folder.Name,
+      collectionType: folder.CollectionType,
+      count: result.TotalRecordCount ?? result.Items?.length ?? 0
+    });
+  }
+
+  let totals: JellyfinLibraryStats["totals"] = {};
+  try {
+    const counts = await fetchJson<JellyfinItemCounts>(`${base}/Items/Counts`, { headers });
+    totals = { movies: counts.MovieCount, series: counts.SeriesCount, episodes: counts.EpisodeCount };
+  } catch {
+    const sumByType = (type: string) =>
+      libraries.filter((lib) => lib.collectionType === type).reduce((sum, lib) => sum + lib.count, 0);
+    totals = { movies: sumByType("movies") || undefined, series: sumByType("tvshows") || undefined };
+  }
+
+  return { configured: true, totals, libraries };
+}

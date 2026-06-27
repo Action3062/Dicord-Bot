@@ -32,7 +32,7 @@ import { commands } from "./commands.js";
 import { config } from "./config.js";
 import { answerQuestion, listFaqTopics, searchFaqItems } from "./faq.js";
 import { FaqStore } from "./faq-store.js";
-import { checkPortalUser, getActiveSessionCount, getJellyfinInfo, getPortalHealth, refreshJellyfinLibrary, searchJellyfinMedia } from "./jellyfin.js";
+import { checkPortalUser, getActiveSessionCount, getJellyfinInfo, getJellyfinLibraryStats, getPortalHealth, refreshJellyfinLibrary, searchJellyfinMedia, type JellyfinLibraryStats } from "./jellyfin.js";
 import {
   analyzeTicketInput,
   generateAssistantReply,
@@ -49,11 +49,13 @@ import { flushPendingWrites } from "./persistence.js";
 import { SupportStore, type SupportStatus } from "./support-store.js";
 import { getTicketCategory, inferTicketCategory } from "./ticket-categories.js";
 import { TicketStore, type Ticket } from "./ticket-store.js";
+import { StatsStore, type StatsChannelEntry, type StatsChannelKind } from "./stats-store.js";
 
 const store = ActivityStore.fromDataDir(config.BOT_DATA_DIR);
 const ticketStore = TicketStore.fromDataDir(config.BOT_DATA_DIR);
 const supportStore = SupportStore.fromDataDir(config.BOT_DATA_DIR);
 const faqStore = FaqStore.fromDataDir(config.BOT_DATA_DIR);
+const statsStore = StatsStore.fromDataDir(config.BOT_DATA_DIR);
 type RecentUserMessage = {
   at: number;
   contentKey: string;
@@ -1946,6 +1948,181 @@ async function setupGuild(guild: Guild) {
   return created;
 }
 
+const STATS_CATEGORY_NAME = "📊 Jellyfin Stats";
+
+type RenamableChannel = { name: string; setName: (name: string, reason?: string) => Promise<unknown> };
+type StatChannelPlanItem = { key: string; kind: StatsChannelKind; libraryId?: string; name: string };
+
+function formatStatCount(value: number) {
+  return value.toLocaleString("de-DE");
+}
+
+function libraryStatEmoji(collectionType?: string) {
+  switch (collectionType) {
+    case "movies":
+      return "🎬";
+    case "tvshows":
+      return "📺";
+    case "music":
+      return "🎵";
+    case "books":
+      return "📚";
+    default:
+      return "📁";
+  }
+}
+
+function statChannelName(label: string, count: number, emoji: string) {
+  // Discord caps channel names at 100 characters.
+  return `${emoji} ${label} — ${formatStatCount(count)}`.slice(0, 100);
+}
+
+function buildStatChannelPlan(stats: JellyfinLibraryStats): StatChannelPlanItem[] {
+  const plan: StatChannelPlanItem[] = [];
+  if (typeof stats.totals.movies === "number") {
+    plan.push({ key: "total-movies", kind: "total-movies", name: statChannelName("Filme", stats.totals.movies, "🎬") });
+  }
+  if (typeof stats.totals.series === "number") {
+    plan.push({ key: "total-series", kind: "total-series", name: statChannelName("Serien", stats.totals.series, "📺") });
+  }
+  if (typeof stats.totals.episodes === "number") {
+    plan.push({ key: "total-episodes", kind: "total-episodes", name: statChannelName("Folgen", stats.totals.episodes, "🎞️") });
+  }
+  for (const library of stats.libraries) {
+    plan.push({
+      key: `library:${library.id}`,
+      kind: "library",
+      libraryId: library.id,
+      name: statChannelName(library.name, library.count, libraryStatEmoji(library.collectionType))
+    });
+  }
+  return plan;
+}
+
+function statEntryKey(entry: StatsChannelEntry) {
+  return entry.libraryId ? `library:${entry.libraryId}` : entry.kind;
+}
+
+async function renameStatChannelIfChanged(channel: RenamableChannel, desired: string) {
+  if (channel.name === desired) return;
+  await channel.setName(desired, "Jellyfin stats update").catch((error) => {
+    console.error("[stats] rename failed", error);
+  });
+}
+
+function lockedStatOverwrites(guild: Guild) {
+  return [{ id: guild.roles.everyone.id, deny: [PermissionFlagsBits.Connect] }];
+}
+
+async function updateStatsForGuild(guild: Guild) {
+  const existing = await statsStore.getGuild(guild.id);
+  if (!existing?.channels.length) return;
+  const stats = await getJellyfinLibraryStats();
+  if (!stats.configured) return;
+  const planByKey = new Map(buildStatChannelPlan(stats).map((item) => [item.key, item]));
+  for (const entry of existing.channels) {
+    const item = planByKey.get(statEntryKey(entry));
+    if (!item) continue;
+    const channel = await guild.channels.fetch(entry.channelId).catch(() => null);
+    if (!channel) continue;
+    await renameStatChannelIfChanged(channel as unknown as RenamableChannel, item.name);
+  }
+}
+
+async function updateAllStats() {
+  for (const guild of client.guilds.cache.values()) {
+    await updateStatsForGuild(guild).catch((error) => console.error("[stats] update failed", error));
+  }
+}
+
+async function handleStatsSetup(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+  await interaction.deferReply({ ephemeral: true });
+
+  const stats = await getJellyfinLibraryStats();
+  if (!stats.configured) {
+    await interaction.editReply("Jellyfin ist nicht konfiguriert (JELLYFIN_BASE_URL / JELLYFIN_API_KEY fehlen).");
+    return;
+  }
+  const plan = buildStatChannelPlan(stats);
+  if (!plan.length) {
+    await interaction.editReply("Es kamen keine Bibliotheken oder Zahlen von Jellyfin zurueck.");
+    return;
+  }
+
+  const existing = await statsStore.getGuild(interaction.guild.id);
+  const existingCategory = existing?.categoryId
+    ? await interaction.guild.channels.fetch(existing.categoryId).catch(() => null)
+    : null;
+  const category = existingCategory?.type === ChannelType.GuildCategory
+    ? existingCategory
+    : await interaction.guild.channels.create({
+        name: STATS_CATEGORY_NAME,
+        type: ChannelType.GuildCategory,
+        permissionOverwrites: lockedStatOverwrites(interaction.guild),
+        reason: "Jellyfin stats setup"
+      });
+
+  const existingByKey = new Map((existing?.channels ?? []).map((entry) => [statEntryKey(entry), entry]));
+  const channels: StatsChannelEntry[] = [];
+  for (const item of plan) {
+    const prior = existingByKey.get(item.key);
+    const priorChannel = prior
+      ? await interaction.guild.channels.fetch(prior.channelId).catch(() => null)
+      : null;
+    if (priorChannel) {
+      await renameStatChannelIfChanged(priorChannel as unknown as RenamableChannel, item.name);
+      channels.push({ channelId: priorChannel.id, kind: item.kind, libraryId: item.libraryId });
+    } else {
+      const created = await interaction.guild.channels.create({
+        name: item.name,
+        type: ChannelType.GuildVoice,
+        parent: category.id,
+        permissionOverwrites: lockedStatOverwrites(interaction.guild),
+        reason: "Jellyfin stats setup"
+      });
+      channels.push({ channelId: created.id, kind: item.kind, libraryId: item.libraryId });
+    }
+  }
+
+  await statsStore.setGuild(interaction.guild.id, { categoryId: category.id, channels });
+  await interaction.editReply(
+    `Statistik-Kanaele eingerichtet: ${channels.length} gesperrte Sprachkanaele unter "${STATS_CATEGORY_NAME}". Aktualisierung alle ${config.STATS_REFRESH_MINUTES} Min (Discord limitiert Umbenennungen, daher nicht in Echtzeit).`
+  );
+}
+
+async function handleStatsRefresh(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+  await interaction.deferReply({ ephemeral: true });
+  const existing = await statsStore.getGuild(interaction.guild.id);
+  if (!existing?.channels.length) {
+    await interaction.editReply("Es sind keine Statistik-Kanaele eingerichtet. Nutze zuerst /stats setup.");
+    return;
+  }
+  await updateStatsForGuild(interaction.guild);
+  await interaction.editReply("Statistik-Kanaele aktualisiert (Umbenennungen koennen wegen Discord-Limits leicht verzoegert sein).");
+}
+
+async function handleStatsRemove(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+  await interaction.deferReply({ ephemeral: true });
+  const existing = await statsStore.getGuild(interaction.guild.id);
+  if (!existing) {
+    await interaction.editReply("Es sind keine Statistik-Kanaele eingerichtet.");
+    return;
+  }
+  for (const entry of existing.channels) {
+    const channel = await interaction.guild.channels.fetch(entry.channelId).catch(() => null);
+    await channel?.delete("Jellyfin stats removed").catch(() => undefined);
+  }
+  if (existing.categoryId) {
+    const category = await interaction.guild.channels.fetch(existing.categoryId).catch(() => null);
+    await category?.delete("Jellyfin stats removed").catch(() => undefined);
+  }
+  await statsStore.clearGuild(interaction.guild.id);
+  await interaction.editReply("Statistik-Kanaele entfernt.");
+}
+
 function pruneEphemeralState() {
   const now = Date.now();
   for (const [userId, messages] of recentMessages) {
@@ -1969,6 +2146,7 @@ client.once(Events.ClientReady, async () => {
   await ticketStore.load();
   await supportStore.load();
   await faqStore.load();
+  await statsStore.load();
   await registerCommands();
   for (const guild of client.guilds.cache.values()) {
     await ensureTicketEntryInstructions(guild).catch(() => undefined);
@@ -1990,6 +2168,10 @@ client.once(Events.ClientReady, async () => {
     });
   }, config.TICKET_FOLLOWUP_CHECK_MINUTES * 60_000);
   setInterval(pruneEphemeralState, EPHEMERAL_PRUNE_INTERVAL_MS);
+  setInterval(() => {
+    void updateAllStats();
+  }, Math.max(10, config.STATS_REFRESH_MINUTES) * 60_000);
+  void updateAllStats();
   console.log(`Discord bot online as ${client.user?.tag}.`);
 });
 
@@ -2269,21 +2451,38 @@ async function handleInteractionCreate(interaction: Interaction) {
   }
 
   if (interaction.commandName === "stats") {
+    const subcommand = interaction.options.getSubcommand();
+    if (subcommand === "setup") {
+      if (!(await ensureCommandPermission(interaction, (member) => memberHasGuildPermission(member, PermissionFlagsBits.ManageGuild)))) return;
+      await handleStatsSetup(interaction);
+      return;
+    }
+    if (subcommand === "refresh") {
+      if (!(await ensureCommandPermission(interaction, (member) => memberHasGuildPermission(member, PermissionFlagsBits.ManageGuild)))) return;
+      await handleStatsRefresh(interaction);
+      return;
+    }
+    if (subcommand === "remove") {
+      if (!(await ensureCommandPermission(interaction, (member) => memberHasGuildPermission(member, PermissionFlagsBits.ManageGuild)))) return;
+      await handleStatsRemove(interaction);
+      return;
+    }
+
     const target = interaction.options.getUser("user") ?? interaction.user;
     const member = interaction.member instanceof GuildMember ? interaction.member : undefined;
     if (target.id !== interaction.user.id && member && !isModerator(member)) {
       await interaction.reply({ ephemeral: true, content: "Du kannst nur deine eigenen Stats ansehen." });
       return;
     }
-    const stats = await store.getUser(target.id);
+    const userStats = await store.getUser(target.id);
     await interaction.reply({
       ephemeral: true,
       content: [
         `Stats fuer ${target.tag}`,
-        `Nachrichten: ${stats.messages}`,
-        `Warnungen: ${stats.warnings}`,
-        `Beitritte: ${stats.joins}`,
-        `Letzte Aktivitaet: ${stats.lastSeenAt ?? "nie"}`
+        `Nachrichten: ${userStats.messages}`,
+        `Warnungen: ${userStats.warnings}`,
+        `Beitritte: ${userStats.joins}`,
+        `Letzte Aktivitaet: ${userStats.lastSeenAt ?? "nie"}`
       ].join("\n")
     });
     return;

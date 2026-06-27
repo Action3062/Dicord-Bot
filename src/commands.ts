@@ -117,11 +117,23 @@ export const commandBuilders = [
         .setRequired(false))),
   new SlashCommandBuilder()
     .setName("stats")
-    .setDescription("Zeigt Aktivitaetsdaten fuer dich oder einen User.")
-    .addUserOption((option) => option
-      .setName("user")
-      .setDescription("User")
-      .setRequired(false)),
+    .setDescription("Aktivitaets- und Jellyfin-Bibliotheks-Statistiken.")
+    .addSubcommand((subcommand) => subcommand
+      .setName("activity")
+      .setDescription("Zeigt Aktivitaetsdaten fuer dich oder einen User.")
+      .addUserOption((option) => option
+        .setName("user")
+        .setDescription("User")
+        .setRequired(false)))
+    .addSubcommand((subcommand) => subcommand
+      .setName("setup")
+      .setDescription("Erstellt/aktualisiert die Jellyfin-Statistik-Sprachkanaele."))
+    .addSubcommand((subcommand) => subcommand
+      .setName("refresh")
+      .setDescription("Aktualisiert die Statistik-Kanaele sofort."))
+    .addSubcommand((subcommand) => subcommand
+      .setName("remove")
+      .setDescription("Entfernt die Statistik-Kanaele wieder.")),
   new SlashCommandBuilder()
     .setName("warn")
     .setDescription("Verwarnt einen User und schreibt es ins Log.")

@@ -50,7 +50,8 @@ const schema = z.object({
   NEW_ACCOUNT_STRICT_TIMEOUT_MINUTES: z.preprocess((value) => optionalNumber(value, 0), z.number().int().nonnegative()),
   TICKET_FOLLOWUP_HOURS: z.preprocess((value) => optionalNumber(value, 24), z.number().int().positive()),
   TICKET_FOLLOWUP_CHECK_MINUTES: z.preprocess((value) => optionalNumber(value, 30), z.number().int().positive()),
-  MAX_OPEN_TICKETS_PER_USER: z.preprocess((value) => optionalNumber(value, 1), z.number().int().positive())
+  MAX_OPEN_TICKETS_PER_USER: z.preprocess((value) => optionalNumber(value, 1), z.number().int().positive()),
+  STATS_REFRESH_MINUTES: z.preprocess((value) => optionalNumber(value, 15), z.number().int().positive())
 });
 
 export const config = schema.parse(process.env);
