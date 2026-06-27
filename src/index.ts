@@ -2142,7 +2142,7 @@ function generateTrialUsername() {
 }
 
 function generateTrialPassword() {
-  return randomFromAlphabet(20, "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789");
+  return randomFromAlphabet(10, "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789");
 }
 
 async function resolveTrialRole(guild: Guild) {
