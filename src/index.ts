@@ -52,6 +52,7 @@ import { TicketStore, type Ticket } from "./ticket-store.js";
 import { StatsStore, type StatsChannelEntry, type StatsChannelKind } from "./stats-store.js";
 import { TrialStore } from "./trial-store.js";
 import { SetupStore } from "./setup-store.js";
+import { buildByteflixServer } from "./byteflix-setup.js";
 import { createTrialAccount, isJfaGoConfigured, listJfaGoUsers } from "./jfago.js";
 
 const store = ActivityStore.fromDataDir(config.BOT_DATA_DIR);
@@ -988,6 +989,12 @@ async function findTicketEntryChannel(guild: Guild) {
   if (config.DISCORD_TICKET_ENTRY_CHANNEL_ID) {
     const configured = await guild.channels.fetch(config.DISCORD_TICKET_ENTRY_CHANNEL_ID).catch(() => null);
     if (configured?.type === ChannelType.GuildText) return configured;
+  }
+
+  const byteflixEntryId = await setupStore.getId(guild.id, "byteflix:channel:support-erstellen");
+  if (byteflixEntryId) {
+    const byteflixEntry = await guild.channels.fetch(byteflixEntryId).catch(() => null);
+    if (byteflixEntry?.type === ChannelType.GuildText) return byteflixEntry;
   }
 
   await guild.channels.fetch().catch(() => null);
@@ -2034,6 +2041,20 @@ async function setupGuild(guild: Guild) {
   return created;
 }
 
+async function handleServerAufbauCommand(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+  await interaction.deferReply({ ephemeral: true });
+  await interaction.guild.setName("Byteflix").catch(() => undefined);
+  const result = await buildByteflixServer(interaction.guild, setupStore);
+  await ensureTicketEntryInstructions(interaction.guild).catch(() => undefined);
+  const header = result.summary.length
+    ? `Byteflix-Aufbau fertig - ${result.summary.length} neue Elemente angelegt:`
+    : "Byteflix-Aufbau fertig - alles war bereits vorhanden (Rechte/Topics wurden aktualisiert).";
+  const body = result.summary.slice(0, 40).join("\n");
+  const extra = result.summary.length > 40 ? `\n… und ${result.summary.length - 40} weitere.` : "";
+  await interaction.editReply(`${header}\n${body}${extra}`.slice(0, 1900));
+}
+
 const STATS_CATEGORY_NAME = "📊 Jellyfin Stats";
 
 type RenamableChannel = { name: string; setName: (name: string, reason?: string) => Promise<unknown> };
@@ -2805,6 +2826,12 @@ async function handleInteractionCreate(interaction: Interaction) {
 
   if (interaction.commandName === "whois") {
     await handleWhoisCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "serveraufbau") {
+    if (!(await ensureCommandPermission(interaction, (member) => memberHasGuildPermission(member, PermissionFlagsBits.ManageGuild)))) return;
+    await handleServerAufbauCommand(interaction);
     return;
   }
 

@@ -222,6 +222,10 @@ export const commandBuilders = [
   new SlashCommandBuilder()
     .setName("setup")
     .setDescription("Erstellt Standard-Kanaele und Rollen fuer den Jellyfin-Discord.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName("serveraufbau")
+    .setDescription("Baut die komplette Byteflix-Serverstruktur (Rollen, Kanaele, Rechte) auf.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
 ];
 
