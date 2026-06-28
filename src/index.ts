@@ -2210,7 +2210,8 @@ async function handleTrialCommand(interaction: ChatInputCommandInteraction) {
   }
 
   const expiresAt = Date.now() + config.TRIAL_HOURS * 60 * 60_000;
-  const loginUrl = config.JELLYFIN_BASE_URL ? config.JELLYFIN_BASE_URL.replace(/\/+$/, "") : "(Jellyfin-URL)";
+  const loginBase = config.JELLYFIN_PUBLIC_URL || config.JELLYFIN_BASE_URL;
+  const loginUrl = loginBase ? loginBase.replace(/\/+$/, "") : "(Jellyfin-URL)";
   const expiryTag = `<t:${Math.floor(expiresAt / 1000)}:R>`;
 
   const dm = [

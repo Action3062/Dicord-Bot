@@ -28,6 +28,7 @@ const schema = z.object({
   PUBLIC_BASE_URL: z.string().url().default("http://localhost:3000"),
   API_PUBLIC_BASE_URL: z.string().url().default("http://localhost:4000"),
   JELLYFIN_BASE_URL: z.string().default(""),
+  JELLYFIN_PUBLIC_URL: z.string().default(""),
   JELLYFIN_API_KEY: z.string().default(""),
   BOT_DATA_DIR: z.string().default("./data"),
   AUTO_REGISTER_COMMANDS: z.preprocess((value) => boolFromEnv(value, true), z.boolean()),
