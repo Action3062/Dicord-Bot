@@ -108,7 +108,7 @@ if (config.ENABLE_MEMBER_MONITORING || config.ENABLE_NEW_ACCOUNT_PROTECTION) {
   intents.push(GatewayIntentBits.GuildMembers);
 }
 
-if (config.ENABLE_MESSAGE_QA || config.ENABLE_AI_ASSISTANT || config.ENABLE_SUPPORT_MESSAGE_CONTENT || config.ENABLE_MODERATION_CONTENT) {
+if (config.ENABLE_MESSAGE_QA || config.ENABLE_AI_ASSISTANT || config.ENABLE_SUPPORT_MESSAGE_CONTENT || config.ENABLE_MODERATION_CONTENT || config.ENABLE_LINK_FILTER) {
   intents.push(GatewayIntentBits.MessageContent);
 }
 
@@ -208,6 +208,21 @@ function normalizeMessageContent(value: string) {
 
 function countLinks(value: string) {
   return value.match(/(?:https?:\/\/|www\.)\S+/gi)?.length ?? 0;
+}
+
+function extractLinkHost(raw: string) {
+  return raw.replace(/^https?:\/\//i, "").replace(/^www\./i, "").split(/[/?#]/)[0].toLowerCase();
+}
+
+// True if the message contains at least one link whose host is not on LINK_WHITELIST.
+function messageHasBlockedLink(content: string) {
+  const matches = content.match(/(?:https?:\/\/|www\.)\S+/gi);
+  if (!matches) return false;
+  const whitelist = config.LINK_WHITELIST.split(",").map((entry) => entry.trim().toLowerCase()).filter(Boolean);
+  return matches.some((raw) => {
+    const host = extractLinkHost(raw);
+    return !whitelist.some((domain) => host === domain || host.endsWith(`.${domain}`));
+  });
 }
 
 function findDiscordInviteCodes(value: string) {
@@ -644,6 +659,21 @@ async function handleScamPhraseMessage(message: Message) {
     }).catch(() => undefined);
   }
 
+  return true;
+}
+
+async function handleLinkFilterMessage(message: Message) {
+  if (!config.ENABLE_LINK_FILTER || !message.guild) return false;
+  if (!messageHasBlockedLink(message.content)) return false;
+  const member = await moderationMember(message);
+  if (!member) return false; // team/mods are exempt
+  await message.delete().catch(() => undefined);
+  if (canWarnForRule(message.author.id, "link_filter") && canSend(message.channel)) {
+    const notice = await (message.channel as TextChannel)
+      .send({ content: `<@${message.author.id}> Links sind hier nicht erlaubt.` })
+      .catch(() => null);
+    if (notice) setTimeout(() => void notice.delete().catch(() => undefined), 8000).unref();
+  }
   return true;
 }
 
@@ -2636,6 +2666,7 @@ async function handleMessageCreate(message: Message) {
   if (!inTicketChannel && !inEntryChannel) {
     if (await handleInviteProtectionMessage(message)) return;
     if (await handleScamPhraseMessage(message)) return;
+    if (await handleLinkFilterMessage(message)) return;
     if (await handleAdvancedAntiSpamMessage(message)) return;
   }
 

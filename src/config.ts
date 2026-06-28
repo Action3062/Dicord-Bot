@@ -40,6 +40,8 @@ const schema = z.object({
   ENABLE_SUPPORT_MESSAGE_CONTENT: z.preprocess((value) => boolFromEnv(value, false), z.boolean()),
   ENABLE_MODERATION_CONTENT: z.preprocess((value) => boolFromEnv(value, false), z.boolean()),
   ENABLE_ADVANCED_ANTI_SPAM: z.preprocess((value) => boolFromEnv(value, true), z.boolean()),
+  ENABLE_LINK_FILTER: z.preprocess((value) => boolFromEnv(value, false), z.boolean()),
+  LINK_WHITELIST: z.string().default(""),
   ENABLE_INVITE_LINK_PROTECTION: z.preprocess((value) => boolFromEnv(value, true), z.boolean()),
   ENABLE_SCAM_PHRASE_PROTECTION: z.preprocess((value) => boolFromEnv(value, true), z.boolean()),
   ENABLE_NEW_ACCOUNT_PROTECTION: z.preprocess((value) => boolFromEnv(value, true), z.boolean()),
