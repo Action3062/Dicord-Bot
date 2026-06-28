@@ -138,6 +138,16 @@ export const commandBuilders = [
     .setName("trial")
     .setDescription("Erstellt dir einen zeitlich begrenzten Jellyfin-Testzugang."),
   new SlashCommandBuilder()
+    .setName("meinaccount")
+    .setDescription("Zeigt deinen verknuepften Jellyfin-Account und Status."),
+  new SlashCommandBuilder()
+    .setName("whois")
+    .setDescription("Zeigt den verknuepften Jellyfin-Account eines Users (Team).")
+    .addUserOption((option) => option
+      .setName("user")
+      .setDescription("User")
+      .setRequired(true)),
+  new SlashCommandBuilder()
     .setName("warn")
     .setDescription("Verwarnt einen User und schreibt es ins Log.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)

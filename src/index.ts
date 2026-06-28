@@ -51,7 +51,7 @@ import { getTicketCategory, inferTicketCategory } from "./ticket-categories.js";
 import { TicketStore, type Ticket } from "./ticket-store.js";
 import { StatsStore, type StatsChannelEntry, type StatsChannelKind } from "./stats-store.js";
 import { TrialStore } from "./trial-store.js";
-import { createTrialAccount, isJfaGoConfigured } from "./jfago.js";
+import { createTrialAccount, isJfaGoConfigured, listJfaGoUsers } from "./jfago.js";
 
 const store = ActivityStore.fromDataDir(config.BOT_DATA_DIR);
 const ticketStore = TicketStore.fromDataDir(config.BOT_DATA_DIR);
@@ -2270,6 +2270,128 @@ async function expireTrials() {
   }
 }
 
+const ABO_ROLE_NAME = "Abo";
+const PREMIUM_ROLE_NAME = "Premium Abo";
+// Trials run TRIAL_HOURS (default 26). An account whose live jfa-go expiry is well
+// beyond that has been upgraded (paid) and must not be treated as a trial anymore.
+const EXTENDED_THRESHOLD_MS = 30 * 60 * 60_000;
+
+async function resolveManagedRole(guild: Guild, configuredId: string, name: string) {
+  if (configuredId) {
+    const byId = guild.roles.cache.get(configuredId) ?? await guild.roles.fetch(configuredId).catch(() => null);
+    if (byId) return byId;
+  }
+  const byName = guild.roles.cache.find((role) => role.name.toLowerCase() === name.toLowerCase());
+  if (byName) return byName;
+  return guild.roles.create({ name, reason: "Account-Rollen (Setup)" }).catch(() => null);
+}
+
+async function ensureAccountRoles(guild: Guild) {
+  await resolveManagedRole(guild, config.DISCORD_TRIAL_ROLE_ID, TRIAL_ROLE_NAME);
+  await resolveManagedRole(guild, config.DISCORD_ABO_ROLE_ID, ABO_ROLE_NAME);
+  await resolveManagedRole(guild, config.DISCORD_PREMIUM_ROLE_ID, PREMIUM_ROLE_NAME);
+}
+
+function memberHasSubscription(member: GuildMember) {
+  const names = [ABO_ROLE_NAME.toLowerCase(), PREMIUM_ROLE_NAME.toLowerCase()];
+  const ids = [config.DISCORD_ABO_ROLE_ID, config.DISCORD_PREMIUM_ROLE_ID].filter(Boolean);
+  return member.roles.cache.some((role) => ids.includes(role.id) || names.includes(role.name.toLowerCase()));
+}
+
+function accountTypeLabel(type?: string) {
+  return type === "extended" ? "Abo/Verlaengert" : "Trial";
+}
+
+async function syncAccounts() {
+  if (!isJfaGoConfigured()) return;
+  const entries = await trialStore.allEntries();
+  if (!entries.length) return;
+
+  let users;
+  try {
+    users = await listJfaGoUsers();
+  } catch (error) {
+    console.error("[accounts] jfa-go Benutzerliste fehlgeschlagen", error);
+    return; // safety: never treat accounts as deleted when the list can't be fetched
+  }
+  if (!users.length) {
+    console.error("[accounts] jfa-go lieferte 0 Benutzer trotz vorhandener Links - Cleanup uebersprungen");
+    return;
+  }
+
+  const byName = new Map(users.map((user) => [user.name.toLowerCase(), user]));
+  const now = Date.now();
+
+  for (const { guildId, entry } of entries) {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    const jfaUser = byName.get(entry.jellyfinUsername.toLowerCase());
+
+    if (!jfaUser) {
+      // Account no longer exists in jfa-go (expiry/inactivity deletion).
+      const member = await guild.members.fetch(entry.userId).catch(() => null);
+      const subscriber = member ? memberHasSubscription(member) : false;
+      if (member && entry.roleId) await member.roles.remove(entry.roleId, "Account entfernt").catch(() => undefined);
+      if (subscriber && member) {
+        await member.send("Dein Jellyfin-Account wurde wegen Inaktivitaet entfernt. Melde dich beim Team, um ihn wiederherzustellen.").catch(() => undefined);
+      }
+      await logTrial(guild, new EmbedBuilder()
+        .setTitle("Account entfernt")
+        .setDescription(`<@${entry.userId}> - Jellyfin-Account \`${entry.jellyfinUsername}\` existiert nicht mehr.`)
+        .addFields({ name: "Typ", value: subscriber ? "Abo" : "Trial", inline: true })
+        .setColor(0xe67e22)
+        .setTimestamp());
+      await trialStore.remove(guildId, entry.userId); // erlaubt wieder ein /trial
+      continue;
+    }
+
+    // Account exists: classify by live jfa-go expiry (Unix seconds; 0 = no expiry).
+    const expiryMs = jfaUser.expiry > 0 ? jfaUser.expiry * 1000 : Number.POSITIVE_INFINITY;
+    const type = expiryMs - now > EXTENDED_THRESHOLD_MS ? "extended" : "trial";
+    if (entry.type !== type) await trialStore.set(guildId, { ...entry, type });
+    if (type === "extended" && entry.roleId) {
+      const member = await guild.members.fetch(entry.userId).catch(() => null);
+      if (member?.roles.cache.has(entry.roleId)) {
+        await member.roles.remove(entry.roleId, "Account hochgestuft").catch(() => undefined);
+      }
+    }
+  }
+}
+
+async function handleMeinAccountCommand(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+  const entry = await trialStore.get(interaction.guild.id, interaction.user.id);
+  if (!entry) {
+    await interaction.reply({ ephemeral: true, content: "Du hast aktuell keinen verknuepften Jellyfin-Account. Nutze /trial fuer einen Testzugang." });
+    return;
+  }
+  const lines = [
+    `Jellyfin-Benutzer: \`${entry.jellyfinUsername}\``,
+    `Typ: ${accountTypeLabel(entry.type)}`
+  ];
+  if (entry.type !== "extended") lines.push(`Trial laeuft ab: <t:${Math.floor(entry.expiresAt / 1000)}:R>`);
+  await interaction.reply({ ephemeral: true, content: lines.join("\n") });
+}
+
+async function handleWhoisCommand(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+  if (!(await ensureCommandPermission(interaction, isModerator))) return;
+  const target = interaction.options.getUser("user", true);
+  const entry = await trialStore.get(interaction.guild.id, target.id);
+  if (!entry) {
+    await interaction.reply({ ephemeral: true, content: `${target.tag} hat keinen verknuepften Jellyfin-Account.` });
+    return;
+  }
+  await interaction.reply({
+    ephemeral: true,
+    content: [
+      `${target.tag} -> Jellyfin \`${entry.jellyfinUsername}\``,
+      `Typ: ${accountTypeLabel(entry.type)}`,
+      `Verknuepft seit: ${entry.createdAt}`
+    ].join("\n")
+  });
+}
+
 function pruneEphemeralState() {
   const now = Date.now();
   for (const [userId, messages] of recentMessages) {
@@ -2324,6 +2446,13 @@ client.once(Events.ClientReady, async () => {
     void expireTrials().catch((error) => console.error("[trial] expire failed", error));
   }, 5 * 60_000);
   void expireTrials();
+  for (const guild of client.guilds.cache.values()) {
+    await ensureAccountRoles(guild).catch(() => undefined);
+  }
+  setInterval(() => {
+    void syncAccounts().catch((error) => console.error("[accounts] sync failed", error));
+  }, 60 * 60_000);
+  void syncAccounts();
   console.log(`Discord bot online as ${client.user?.tag}.`);
 });
 
@@ -2575,6 +2704,16 @@ async function handleInteractionCreate(interaction: Interaction) {
 
   if (interaction.commandName === "trial") {
     await handleTrialCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "meinaccount") {
+    await handleMeinAccountCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "whois") {
+    await handleWhoisCommand(interaction);
     return;
   }
 

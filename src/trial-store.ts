@@ -6,9 +6,10 @@ export type TrialEntry = {
   userId: string;
   jellyfinUsername: string;
   createdAt: string; // ISO timestamp
-  expiresAt: number; // epoch milliseconds
+  expiresAt: number; // epoch milliseconds (local trial expiry)
   roleId?: string;
   roleRemoved?: boolean;
+  type?: "trial" | "extended"; // classified from the live jfa-go expiry during sync
 };
 
 type TrialState = {
@@ -57,6 +58,24 @@ export class TrialStore {
       }
     }
     return out;
+  }
+
+  async allEntries(): Promise<Array<{ guildId: string; entry: TrialEntry }>> {
+    await this.load();
+    const out: Array<{ guildId: string; entry: TrialEntry }> = [];
+    for (const [guildId, users] of Object.entries(this.state.guilds)) {
+      for (const entry of Object.values(users)) out.push({ guildId, entry });
+    }
+    return out;
+  }
+
+  async remove(guildId: string, userId: string) {
+    await this.load();
+    const guildEntries = this.state.guilds[guildId];
+    if (guildEntries && guildEntries[userId]) {
+      delete guildEntries[userId];
+      await this.save();
+    }
   }
 
   private async save() {

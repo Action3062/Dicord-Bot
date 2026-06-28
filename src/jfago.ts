@@ -105,3 +105,41 @@ export async function createTrialAccount(options: {
     throw new Error(`jfa-go Account anlegen fehlgeschlagen: ${createRes.status} ${text}`.trim());
   }
 }
+
+export type JfaGoUser = {
+  name: string;
+  id: string;
+  expiry: number; // Unix seconds (0 = no expiry)
+  disabled: boolean;
+  discordId?: string;
+};
+
+function pick(obj: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    if (obj[key] !== undefined && obj[key] !== null) return obj[key];
+  }
+  return undefined;
+}
+
+/**
+ * List all jfa-go users. Parsed defensively because the JSON tag casing of the
+ * user-list response differs between jfa-go versions.
+ */
+export async function listJfaGoUsers(): Promise<JfaGoUser[]> {
+  const res = await authed("/users", { method: "GET" });
+  if (!res.ok) throw new Error(`jfa-go Benutzerliste fehlgeschlagen: ${res.status} ${res.statusText}`);
+  const data = (await res.json()) as Record<string, unknown>;
+  const rawList = (pick(data, "users", "UserList", "user_list") ?? []) as Array<Record<string, unknown>>;
+  return rawList
+    .map((entry) => {
+      const discord = pick(entry, "discord_id", "DiscordID");
+      return {
+        name: String(pick(entry, "name", "Name") ?? ""),
+        id: String(pick(entry, "id", "ID") ?? ""),
+        expiry: Number(pick(entry, "expiry", "Expiry") ?? 0),
+        disabled: Boolean(pick(entry, "disabled", "Disabled") ?? false),
+        discordId: discord ? String(discord) : undefined
+      };
+    })
+    .filter((entry) => entry.name);
+}

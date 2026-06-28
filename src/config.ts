@@ -58,7 +58,9 @@ const schema = z.object({
   JFA_GO_PROFILE: z.string().default(""),
   TRIAL_HOURS: z.preprocess((value) => optionalNumber(value, 26), z.number().int().positive()),
   DISCORD_TRIAL_ROLE_ID: z.string().default(""),
-  DISCORD_TRIAL_LOG_CHANNEL_ID: z.string().default("")
+  DISCORD_TRIAL_LOG_CHANNEL_ID: z.string().default(""),
+  DISCORD_ABO_ROLE_ID: z.string().default(""),
+  DISCORD_PREMIUM_ROLE_ID: z.string().default("")
 });
 
 export const config = schema.parse(process.env);
