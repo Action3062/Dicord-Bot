@@ -941,6 +941,25 @@ async function ensureTicketCategory(guild: Guild) {
   });
 }
 
+async function ensureTicketArchiveCategory(guild: Guild) {
+  if (config.DISCORD_TICKET_ARCHIVE_CATEGORY_ID) {
+    const configured = await guild.channels.fetch(config.DISCORD_TICKET_ARCHIVE_CATEGORY_ID).catch(() => null);
+    if (configured?.type === ChannelType.GuildCategory) return configured;
+  }
+
+  const existing = guild.channels.cache.find((channel) =>
+    channel.type === ChannelType.GuildCategory && ["archiv", "archive"].includes(channel.name.toLowerCase())
+  );
+  if (existing?.type === ChannelType.GuildCategory) return existing;
+
+  return guild.channels.create({
+    name: "ARCHIV",
+    type: ChannelType.GuildCategory,
+    permissionOverwrites: ticketPermissionOverwrites(guild),
+    reason: "Ticket-Archiv setup"
+  }).catch(() => null);
+}
+
 async function findTicketEntryChannel(guild: Guild) {
   if (config.DISCORD_TICKET_ENTRY_CHANNEL_ID) {
     const configured = await guild.channels.fetch(config.DISCORD_TICKET_ENTRY_CHANNEL_ID).catch(() => null);
@@ -1108,6 +1127,7 @@ async function lockTicketChannel(ticket: Ticket, reason?: string) {
 
   const typedChannel = channel as unknown as {
     setName?: (name: string, reason?: string) => Promise<unknown>;
+    setParent?: (parentId: string, options?: { lockPermissions?: boolean; reason?: string }) => Promise<unknown>;
     permissionOverwrites?: {
       edit: (id: string, options: Record<string, boolean>, reason?: string) => Promise<unknown>;
     };
@@ -1135,6 +1155,15 @@ async function lockTicketChannel(ticket: Ticket, reason?: string) {
   }
 
   await typedChannel.setName?.(`closed-${ticketNumber(ticket.number)}`, reason).catch(logLockFailure("rename"));
+
+  // Move the closed ticket into the archive category (channel-level overwrites are
+  // kept, so the owner still sees it read-only).
+  if (guild) {
+    const archive = await ensureTicketArchiveCategory(guild);
+    if (archive) {
+      await typedChannel.setParent?.(archive.id, { lockPermissions: false, reason }).catch(logLockFailure("move to archive"));
+    }
+  }
 }
 
 async function collectTicketMessages(ticket: Ticket, guild: Guild, limit = 1000) {
