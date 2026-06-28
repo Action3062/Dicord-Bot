@@ -51,6 +51,7 @@ import { getTicketCategory, inferTicketCategory } from "./ticket-categories.js";
 import { TicketStore, type Ticket } from "./ticket-store.js";
 import { StatsStore, type StatsChannelEntry, type StatsChannelKind } from "./stats-store.js";
 import { TrialStore } from "./trial-store.js";
+import { SetupStore } from "./setup-store.js";
 import { createTrialAccount, isJfaGoConfigured, listJfaGoUsers } from "./jfago.js";
 
 const store = ActivityStore.fromDataDir(config.BOT_DATA_DIR);
@@ -59,6 +60,7 @@ const supportStore = SupportStore.fromDataDir(config.BOT_DATA_DIR);
 const faqStore = FaqStore.fromDataDir(config.BOT_DATA_DIR);
 const statsStore = StatsStore.fromDataDir(config.BOT_DATA_DIR);
 const trialStore = TrialStore.fromDataDir(config.BOT_DATA_DIR);
+const setupStore = SetupStore.fromDataDir(config.BOT_DATA_DIR);
 type RecentUserMessage = {
   at: number;
   contentKey: string;
@@ -928,17 +930,28 @@ async function ensureTicketCategory(guild: Guild) {
     if (configured?.type === ChannelType.GuildCategory) return configured;
   }
 
+  const storedId = await setupStore.getId(guild.id, "category:tickets");
+  if (storedId) {
+    const stored = await guild.channels.fetch(storedId).catch(() => null);
+    if (stored?.type === ChannelType.GuildCategory) return stored;
+  }
+
   const existing = guild.channels.cache.find((channel) =>
     channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === "tickets"
   );
-  if (existing?.type === ChannelType.GuildCategory) return existing;
+  if (existing?.type === ChannelType.GuildCategory) {
+    await setupStore.setId(guild.id, "category:tickets", existing.id);
+    return existing;
+  }
 
-  return guild.channels.create({
+  const createdCategory = await guild.channels.create({
     name: "TICKETS",
     type: ChannelType.GuildCategory,
     permissionOverwrites: ticketPermissionOverwrites(guild),
     reason: "Jellyfin ticket system setup"
   });
+  await setupStore.setId(guild.id, "category:tickets", createdCategory.id);
+  return createdCategory;
 }
 
 async function ensureTicketArchiveCategory(guild: Guild) {
@@ -947,17 +960,28 @@ async function ensureTicketArchiveCategory(guild: Guild) {
     if (configured?.type === ChannelType.GuildCategory) return configured;
   }
 
+  const storedId = await setupStore.getId(guild.id, "category:archive");
+  if (storedId) {
+    const stored = await guild.channels.fetch(storedId).catch(() => null);
+    if (stored?.type === ChannelType.GuildCategory) return stored;
+  }
+
   const existing = guild.channels.cache.find((channel) =>
     channel.type === ChannelType.GuildCategory && ["archiv", "archive"].includes(channel.name.toLowerCase())
   );
-  if (existing?.type === ChannelType.GuildCategory) return existing;
+  if (existing?.type === ChannelType.GuildCategory) {
+    await setupStore.setId(guild.id, "category:archive", existing.id);
+    return existing;
+  }
 
-  return guild.channels.create({
+  const createdCategory = await guild.channels.create({
     name: "ARCHIV",
     type: ChannelType.GuildCategory,
     permissionOverwrites: ticketPermissionOverwrites(guild),
     reason: "Ticket-Archiv setup"
   }).catch(() => null);
+  if (createdCategory) await setupStore.setId(guild.id, "category:archive", createdCategory.id);
+  return createdCategory;
 }
 
 async function findTicketEntryChannel(guild: Guild) {
@@ -1944,37 +1968,67 @@ async function registerCommands() {
   console.log(`Registered ${commands.length} global commands.`);
 }
 
+// Resolve a managed role by remembered ID first, then by name (caching the ID), and
+// only create it if it really does not exist - so renaming it never spawns a duplicate.
+async function ensureSetupRole(guild: Guild, key: string, name: string) {
+  const storedId = await setupStore.getId(guild.id, key);
+  if (storedId) {
+    const byId = guild.roles.cache.get(storedId) ?? await guild.roles.fetch(storedId).catch(() => null);
+    if (byId) return { created: false };
+  }
+  const byName = guild.roles.cache.find((role) => role.name.toLowerCase() === name.toLowerCase());
+  if (byName) {
+    await setupStore.setId(guild.id, key, byName.id);
+    return { created: false };
+  }
+  const role = await guild.roles.create({ name, reason: "Jellyfin Discord bot setup" });
+  await setupStore.setId(guild.id, key, role.id);
+  return { created: true };
+}
+
+async function ensureSetupTextChannel(guild: Guild, key: string, name: string, parentId: string) {
+  const storedId = await setupStore.getId(guild.id, key);
+  if (storedId) {
+    const byId = await guild.channels.fetch(storedId).catch(() => null);
+    if (byId) return { created: false };
+  }
+  const byName = guild.channels.cache.find((channel) =>
+    channel.type === ChannelType.GuildText && channel.name.toLowerCase() === name.toLowerCase()
+  );
+  if (byName) {
+    await setupStore.setId(guild.id, key, byName.id);
+    return { created: false };
+  }
+  const channel = await guild.channels.create({ name, type: ChannelType.GuildText, parent: parentId, reason: "Jellyfin Discord bot setup" });
+  await setupStore.setId(guild.id, key, channel.id);
+  return { created: true };
+}
+
 async function setupGuild(guild: Guild) {
-  const existingRoleNames = new Set(guild.roles.cache.map((role) => role.name.toLowerCase()));
   const created: string[] = [];
 
-  if (!existingRoleNames.has("jellyfin mitglied")) {
-    await guild.roles.create({ name: "Jellyfin Mitglied", reason: "Jellyfin Discord bot setup" });
-    created.push("Rolle: Jellyfin Mitglied");
-  }
-  if (!existingRoleNames.has("support")) {
-    await guild.roles.create({ name: "Support", reason: "Jellyfin Discord bot setup" });
-    created.push("Rolle: Support");
-  }
+  if ((await ensureSetupRole(guild, "role:member", "Jellyfin Mitglied")).created) created.push("Rolle: Jellyfin Mitglied");
+  if ((await ensureSetupRole(guild, "role:support", "Support")).created) created.push("Rolle: Support");
 
-  const category = guild.channels.cache.find((channel) =>
-    channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === "jellyfin"
-  ) ?? await guild.channels.create({
-    name: "Jellyfin",
-    type: ChannelType.GuildCategory,
-    reason: "Jellyfin Discord bot setup"
-  });
+  const categoryStoredId = await setupStore.getId(guild.id, "category:jellyfin");
+  let category = categoryStoredId ? await guild.channels.fetch(categoryStoredId).catch(() => null) : null;
+  if (category?.type !== ChannelType.GuildCategory) {
+    const byName = guild.channels.cache.find((channel) =>
+      channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === "jellyfin"
+    );
+    if (byName?.type === ChannelType.GuildCategory) {
+      category = byName;
+    } else {
+      category = await guild.channels.create({ name: "Jellyfin", type: ChannelType.GuildCategory, reason: "Jellyfin Discord bot setup" });
+      created.push("Kategorie: Jellyfin");
+    }
+  }
+  await setupStore.setId(guild.id, "category:jellyfin", category.id);
 
-  const channelNames = new Set(guild.channels.cache.map((channel) => channel.name.toLowerCase()));
   for (const name of ["welcome", "support", "status", "payments", "mod-log"]) {
-    if (channelNames.has(name)) continue;
-    await guild.channels.create({
-      name,
-      type: ChannelType.GuildText,
-      parent: category.id,
-      reason: "Jellyfin Discord bot setup"
-    });
-    created.push(`Kanal: #${name}`);
+    if ((await ensureSetupTextChannel(guild, `channel:${name}`, name, category.id)).created) {
+      created.push(`Kanal: #${name}`);
+    }
   }
 
   return created;
@@ -2453,6 +2507,7 @@ client.once(Events.ClientReady, async () => {
   await faqStore.load();
   await statsStore.load();
   await trialStore.load();
+  await setupStore.load();
   await registerCommands();
   for (const guild of client.guilds.cache.values()) {
     await ensureTicketEntryInstructions(guild).catch(() => undefined);
