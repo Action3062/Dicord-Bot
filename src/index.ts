@@ -1982,12 +1982,9 @@ function statChannelName(label: string, count: number, emoji: string) {
 
 function buildStatChannelPlan(stats: JellyfinLibraryStats): StatChannelPlanItem[] {
   const plan: StatChannelPlanItem[] = [];
-  if (typeof stats.totals.movies === "number") {
-    plan.push({ key: "total-movies", kind: "total-movies", name: statChannelName("Filme", stats.totals.movies, "🎬") });
-  }
-  if (typeof stats.totals.series === "number") {
-    plan.push({ key: "total-series", kind: "total-series", name: statChannelName("Serien", stats.totals.series, "📺") });
-  }
+  // Movie/series totals are intentionally omitted: with a single movies/tvshows
+  // library they collide 1:1 with the per-library channels below (duplicate names).
+  // Episodes have no per-library channel, so the "Folgen" total is kept.
   if (typeof stats.totals.episodes === "number") {
     plan.push({ key: "total-episodes", kind: "total-episodes", name: statChannelName("Folgen", stats.totals.episodes, "🎞️") });
   }
@@ -2086,6 +2083,15 @@ async function handleStatsSetup(interaction: ChatInputCommandInteraction) {
       });
       channels.push({ channelId: created.id, kind: item.kind, libraryId: item.libraryId });
     }
+  }
+
+  // Remove channels from an earlier setup that are no longer in the plan
+  // (e.g. the old total-movies/total-series channels that caused duplicates).
+  const planKeys = new Set(plan.map((item) => item.key));
+  for (const entry of existing?.channels ?? []) {
+    if (planKeys.has(statEntryKey(entry))) continue;
+    const stale = await interaction.guild.channels.fetch(entry.channelId).catch(() => null);
+    await stale?.delete("Jellyfin stats cleanup").catch(() => undefined);
   }
 
   await statsStore.setGuild(interaction.guild.id, { categoryId: category.id, channels });
