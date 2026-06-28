@@ -72,6 +72,7 @@ type RecentUserMessage = {
 const recentMessages = new Map<string, RecentUserMessage[]>();
 const moderationCooldowns = new Map<string, number>();
 const TICKET_CREATE_BUTTON_ID = "ticket:create";
+const TICKET_CLOSE_BUTTON_ID = "ticket:close";
 const TICKET_CREATE_MODAL_ID = "ticket:create-modal";
 const TICKET_MODAL_SUBJECT_ID = "ticket-subject";
 const TICKET_MODAL_DESCRIPTION_ID = "ticket-description";
@@ -173,7 +174,7 @@ function ticketNumber(value: number) {
 
 function supportStatusLabel(status: SupportStatus) {
   if (status === "online") return "Online";
-  if (status === "busy") return "Beschaeftigt";
+  if (status === "busy") return "Beschäftigt";
   return "Offline";
 }
 
@@ -324,7 +325,7 @@ function extractMediaQuery(value: string) {
     .filter((word) => ![
       "warum", "wieso", "wann", "wo", "ist", "sind", "der", "die", "das", "den", "dem", "ein", "eine",
       "noch", "nicht", "da", "drauf", "auf", "jellyfin", "film", "serie", "staffel", "kommt", "kommen",
-      "gibt", "es", "kannst", "du", "mal", "bitte", "pruefen", "prüfen", "laden", "neu", "reload", "fehlt"
+      "gibt", "es", "kannst", "du", "mal", "bitte", "prüfen", "prüfen", "laden", "neu", "reload", "fehlt"
     ].includes(word.toLowerCase()))
     .join(" ")
     .trim();
@@ -386,10 +387,10 @@ function ticketEntryEmbed() {
   return new EmbedBuilder()
     .setTitle("Support-Tickets")
     .setDescription([
-      "Bitte oeffne fuer Support ein privates Ticket.",
+      "Bitte öffne für Support ein privates Ticket.",
       "",
       "**So geht es:**",
-      "1. Klicke unten auf `Ticket oeffnen`.",
+      "1. Klicke unten auf `Ticket öffnen`.",
       "2. Fuell das kurze Formular aus.",
       "3. Der Bot erstellt daraus ein privates Ticket.",
       "",
@@ -407,7 +408,7 @@ function ticketEntryComponents() {
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(TICKET_CREATE_BUTTON_ID)
-        .setLabel("Ticket oeffnen")
+        .setLabel("Ticket öffnen")
         .setStyle(ButtonStyle.Primary)
     )
   ];
@@ -452,7 +453,7 @@ async function ensureCommandPermission(
 ) {
   const member = await getInteractionMember(interaction);
   if (member && check(member)) return true;
-  const content = "Dir fehlt die Berechtigung fuer diesen Befehl.";
+  const content = "Dir fehlt die Berechtigung für diesen Befehl.";
   if (interaction.deferred || interaction.replied) await interaction.editReply(content);
   else await interaction.reply({ ephemeral: true, content });
   return false;
@@ -605,7 +606,7 @@ async function handleInviteProtectionMessage(message: Message) {
     if (canWarnForRule(message.author.id, "foreign_invite")) {
       const reason = inviteGuildId
         ? "Fremder Discord-Invite gepostet"
-        : "Unbekannter oder ungueltiger Discord-Invite gepostet";
+        : "Unbekannter oder ungültiger Discord-Invite gepostet";
       const result = await warnAndEscalate({
         guild: message.guild,
         member,
@@ -641,7 +642,7 @@ async function handleScamPhraseMessage(message: Message) {
   await message.delete().catch(() => undefined);
   if (!canWarnForRule(message.author.id, "scam_phrase")) return true;
 
-  const reason = `Moegliche Scam-/Phishing-Nachricht: ${matches.join(", ")}`;
+  const reason = `Mögliche Scam-/Phishing-Nachricht: ${matches.join(", ")}`;
   const result = await warnAndEscalate({
     guild: message.guild,
     member,
@@ -655,7 +656,7 @@ async function handleScamPhraseMessage(message: Message) {
 
   if (canSend(message.channel)) {
     await message.channel.send({
-      content: `<@${message.author.id}> diese Nachricht wurde als moeglicher Scam geloescht. Warnungen: ${result.total}`
+      content: `<@${message.author.id}> diese Nachricht wurde als möglicher Scam gelöscht. Warnungen: ${result.total}`
     }).catch(() => undefined);
   }
 
@@ -725,7 +726,7 @@ async function handleAdvancedAntiSpamMessage(message: Message) {
   }
   if (content && looksLikeCapsSpam(content)) {
     rules.push("caps_spam");
-    reasons.push("Zu viel Grossschreibung");
+    reasons.push("Zu viel Großschreibung");
   }
   if (linkCount >= 3 || linkMessages >= 4 || recentLinkCount >= 6) {
     rules.push("link_spam");
@@ -877,7 +878,7 @@ async function buildAssistantContext(options: {
 // visible disclaimer making clear it is machine-generated and not binding. The
 // "-#" prefix renders as Discord subtext (small, muted).
 const AI_ANSWER_DISCLAIMER =
-  "\n\n-# KI-generierte Antwort - ohne Gewaehr. Bei wichtigen oder verbindlichen Fragen bitte ein Ticket oeffnen.";
+  "\n\n-# KI-generierte Antwort - ohne Gewaehr. Bei wichtigen oder verbindlichen Fragen bitte ein Ticket öffnen.";
 
 async function answerWithAiAssistant(options: {
   guild: Guild;
@@ -1054,7 +1055,7 @@ async function ensureTicketEntryInstructions(guild: Guild) {
   const channel = await findTicketEntryChannel(guild);
   if (!channel) return false;
 
-  await channel.setTopic("Ticket-Eingang: Button Ticket oeffnen, /ticket create oder Nachricht nutzen.").catch(() => undefined);
+  await channel.setTopic("Ticket-Eingang: Button Ticket öffnen, /ticket create oder Nachricht nutzen.").catch(() => undefined);
 
   const recent = await channel.messages.fetch({ limit: 100 }).catch(() => null);
   const matchesInstruction = (message: Message) =>
@@ -1168,7 +1169,7 @@ async function checkTicketFollowUps() {
           .setDescription([
             `Dieses Ticket wartet seit <t:${Math.floor(new Date(waitingSince).getTime() / 1000)}:R> auf eine Team-Antwort.`,
             "",
-            "Bitte kurz reagieren, eine Rueckfrage stellen oder das Ticket schliessen, wenn es erledigt ist."
+            "Bitte kurz reagieren, eine Rückfrage stellen oder das Ticket schließen, wenn es erledigt ist."
           ].join("\n"))
           .addFields(
             { name: "Ticket", value: `#${ticketNumber(ticket.number)} ${ticket.subject}`, inline: true },
@@ -1258,7 +1259,7 @@ function formatTicketMessagesForAi(messages: Message[]) {
   return messages.map((message) => {
     const content = message.content || "[kein Textinhalt]";
     const attachments = message.attachments.size
-      ? ` | Anhaenge: ${[...message.attachments.values()].map((attachment) => attachment.name ?? "Datei").join(", ")}`
+      ? ` | Anhänge: ${[...message.attachments.values()].map((attachment) => attachment.name ?? "Datei").join(", ")}`
       : "";
     return `[${message.createdAt.toISOString()}] ${message.author.tag}: ${content}${attachments}`;
   }).join("\n").slice(-12000);
@@ -1376,14 +1377,23 @@ async function createTicketForUser(options: {
         { name: "Status", value: "Offen", inline: true }
       )
       .setColor(priorityColor(ticket.priority))
-      .setTimestamp()]
+      .setTimestamp()],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(TICKET_CLOSE_BUTTON_ID)
+          .setLabel("Ticket schließen")
+          .setEmoji("🔒")
+          .setStyle(ButtonStyle.Danger)
+      )
+    ]
   });
 
   if (analysis.missingInfoQuestions.length) {
     await channel.send({
       content: `<@${options.user.id}>`,
       embeds: [new EmbedBuilder()
-        .setTitle("Kurze Rueckfragen")
+        .setTitle("Kurze Rückfragen")
         .setDescription([
           "Damit das Team schneller helfen kann, fehlen noch ein paar Infos:",
           "",
@@ -1408,6 +1418,57 @@ async function createTicketForUser(options: {
   return { ticket, channel };
 }
 
+async function closeTicketAndAnnounce(guild: Guild, ticket: Ticket, closerId: string, reason?: string) {
+  const transcriptPath = await createTicketTranscript(ticket, guild).catch(() => undefined);
+  const closed = await ticketStore.close(ticket.id, closerId, reason, transcriptPath);
+  if (!closed) return null;
+
+  await lockTicketChannel(closed, reason || "Ticket geschlossen");
+
+  const channel = await guild.channels.fetch(closed.channelId).catch(() => null);
+  if (canSend(channel)) {
+    await channel.send({
+      embeds: [new EmbedBuilder()
+        .setTitle(`Ticket ${ticketNumber(closed.number)} geschlossen`)
+        .setDescription(reason || "Kein Grund angegeben.")
+        .addFields({ name: "Geschlossen von", value: `<@${closerId}>`, inline: true })
+        .setColor(0xe74c3c)
+        .setTimestamp()]
+    }).catch(() => undefined);
+  }
+
+  await logTicketWithTranscript(guild, new EmbedBuilder()
+    .setTitle("Ticket geschlossen")
+    .setDescription(`<#${closed.channelId}> wurde von <@${closerId}> geschlossen.`)
+    .addFields(
+      { name: "Grund", value: reason || "Kein Grund angegeben." },
+      { name: "Transkript", value: transcriptPath ? "Wurde angehängt und lokal gespeichert." : "Konnte nicht erstellt werden." }
+    )
+    .setColor(0xe74c3c)
+    .setTimestamp(), transcriptPath);
+
+  await createFaqDraftForClosedTicket(guild, closed);
+  return closed;
+}
+
+async function handleTicketCloseButton(interaction: ButtonInteraction) {
+  if (!interaction.guild) return;
+  const ticket = await ticketStore.getByChannel(interaction.guild.id, interaction.channelId);
+  if (!ticket || ticket.status !== "open") {
+    await interaction.reply({ ephemeral: true, content: "Hier gibt es kein offenes Ticket zum Schließen." });
+    return;
+  }
+  const member = interaction.member instanceof GuildMember
+    ? interaction.member
+    : await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  if (ticket.ownerId !== interaction.user.id && (!member || !isTicketTeamMember(member))) {
+    await interaction.reply({ ephemeral: true, content: "Nur der Ticket-Ersteller oder das Team kann dieses Ticket schließen." });
+    return;
+  }
+  await interaction.reply({ ephemeral: true, content: "Ticket wird geschlossen …" });
+  await closeTicketAndAnnounce(interaction.guild, ticket, interaction.user.id);
+}
+
 async function handleTicketCreateButton(interaction: ButtonInteraction) {
   if (!interaction.guild || !interaction.channelId) return;
 
@@ -1416,7 +1477,7 @@ async function handleTicketCreateButton(interaction: ButtonInteraction) {
     await interaction.reply({
       ephemeral: true,
       content: entryChannel
-        ? `Bitte oeffne Tickets nur in <#${entryChannel.id}>.`
+        ? `Bitte öffne Tickets nur in <#${entryChannel.id}>.`
         : "Der Ticket-Eingangskanal wurde nicht gefunden."
     });
     return;
@@ -1424,7 +1485,7 @@ async function handleTicketCreateButton(interaction: ButtonInteraction) {
 
   const modal = new ModalBuilder()
     .setCustomId(TICKET_CREATE_MODAL_ID)
-    .setTitle("Support-Ticket oeffnen")
+    .setTitle("Support-Ticket öffnen")
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
@@ -1439,7 +1500,7 @@ async function handleTicketCreateButton(interaction: ButtonInteraction) {
         new TextInputBuilder()
           .setCustomId(TICKET_MODAL_DESCRIPTION_ID)
           .setLabel("Beschreibe dein Anliegen")
-          .setPlaceholder("Geraet, App, Fehlermeldung, Jellyfin-Name ...")
+          .setPlaceholder("Gerät, App, Fehlermeldung, Jellyfin-Name ...")
           .setStyle(TextInputStyle.Paragraph)
           .setRequired(false)
           .setMaxLength(1000)
@@ -1457,7 +1518,7 @@ async function handleTicketCreateModal(interaction: ModalSubmitInteraction) {
     await interaction.reply({
       ephemeral: true,
       content: entryChannel
-        ? `Bitte oeffne Tickets nur in <#${entryChannel.id}>.`
+        ? `Bitte öffne Tickets nur in <#${entryChannel.id}>.`
         : "Der Ticket-Eingangskanal wurde nicht gefunden."
     });
     return;
@@ -1527,7 +1588,7 @@ function faqDraftComponents(id: string) {
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`${AI_FAQ_APPROVE_PREFIX}${id}`)
-        .setLabel("FAQ uebernehmen")
+        .setLabel("FAQ übernehmen")
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
         .setCustomId(`${AI_FAQ_DISCARD_PREFIX}${id}`)
@@ -1543,13 +1604,13 @@ async function handleSendSuggestionButton(interaction: ButtonInteraction, id: st
     ? interaction.member
     : await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
   if (!member || !isTicketTeamMember(member)) {
-    await interaction.reply({ ephemeral: true, content: "Nur das Team kann Antwortvorschlaege senden." });
+    await interaction.reply({ ephemeral: true, content: "Nur das Team kann Antwortvorschläge senden." });
     return;
   }
 
   const suggestion = pendingReplySuggestions.get(id);
   if (!suggestion) {
-    await interaction.reply({ ephemeral: true, content: "Dieser Vorschlag ist nicht mehr verfuegbar." });
+    await interaction.reply({ ephemeral: true, content: "Dieser Vorschlag ist nicht mehr verfügbar." });
     return;
   }
 
@@ -1583,13 +1644,13 @@ async function handleApproveFaqButton(interaction: ButtonInteraction, id: string
     ? interaction.member
     : await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
   if (!member || !isTicketTeamMember(member)) {
-    await interaction.reply({ ephemeral: true, content: "Nur das Team kann FAQ-Entwuerfe uebernehmen." });
+    await interaction.reply({ ephemeral: true, content: "Nur das Team kann FAQ-Entwuerfe übernehmen." });
     return;
   }
 
   const pending = pendingFaqDrafts.get(id);
   if (!pending || !pending.draft.title || !pending.draft.answer) {
-    await interaction.reply({ ephemeral: true, content: "Dieser FAQ-Entwurf ist nicht mehr verfuegbar." });
+    await interaction.reply({ ephemeral: true, content: "Dieser FAQ-Entwurf ist nicht mehr verfügbar." });
     return;
   }
 
@@ -1603,8 +1664,8 @@ async function handleApproveFaqButton(interaction: ButtonInteraction, id: string
   pendingFaqDrafts.delete(id);
   await interaction.update({
     embeds: [new EmbedBuilder()
-      .setTitle("FAQ uebernommen")
-      .setDescription(`Der Eintrag **${stored.title}** ist jetzt in der dynamischen FAQ verfuegbar.`)
+      .setTitle("FAQ übernommen")
+      .setDescription(`Der Eintrag **${stored.title}** ist jetzt in der dynamischen FAQ verfügbar.`)
       .setColor(0x2ecc71)
       .setTimestamp()],
     components: []
@@ -1664,7 +1725,7 @@ async function handleTicketSuggestCommand(interaction: ChatInputCommandInteracti
   if (!interaction.guild) return;
   const member = await getInteractionMember(interaction);
   if (!member || !isTicketTeamMember(member)) {
-    await interaction.reply({ ephemeral: true, content: "Nur das Team kann Antwortvorschlaege erstellen." });
+    await interaction.reply({ ephemeral: true, content: "Nur das Team kann Antwortvorschläge erstellen." });
     return;
   }
   if (!isOpenAiAssistantReady()) {
@@ -1753,7 +1814,7 @@ async function handleTicketCommand(interaction: ChatInputCommandInteraction) {
       await interaction.reply({
         ephemeral: true,
         content: entryChannel
-          ? `Bitte oeffne Tickets nur in <#${entryChannel.id}>.`
+          ? `Bitte öffne Tickets nur in <#${entryChannel.id}>.`
           : "Der Ticket-Eingangskanal wurde nicht gefunden."
       });
       return;
@@ -1818,44 +1879,14 @@ async function handleTicketCommand(interaction: ChatInputCommandInteraction) {
 
   if (subcommand === "close") {
     if (ticket.ownerId !== interaction.user.id && (!member || !isTicketTeamMember(member))) {
-      await interaction.reply({ ephemeral: true, content: "Nur der Ticket-Ersteller oder das Team kann dieses Ticket schliessen." });
+      await interaction.reply({ ephemeral: true, content: "Nur der Ticket-Ersteller oder das Team kann dieses Ticket schließen." });
       return;
     }
 
     const reason = interaction.options.getString("grund")?.trim();
     await interaction.deferReply();
-    const transcriptPath = await createTicketTranscript(ticket, interaction.guild).catch(() => undefined);
-    const closed = await ticketStore.close(ticket.id, interaction.user.id, reason, transcriptPath);
-    if (!closed) {
-      await interaction.editReply("Ticket konnte nicht gefunden werden.");
-      return;
-    }
-
-    await lockTicketChannel(closed, reason || "Ticket geschlossen");
-    if (canSend(interaction.channel)) {
-      await interaction.channel.send({
-        embeds: [new EmbedBuilder()
-          .setTitle(`Ticket ${ticketNumber(closed.number)} geschlossen`)
-          .setDescription(reason || "Kein Grund angegeben.")
-          .addFields({ name: "Geschlossen von", value: `<@${interaction.user.id}>`, inline: true })
-          .setColor(0xe74c3c)
-          .setTimestamp()]
-      }).catch(() => undefined);
-    }
-
-    await logTicketWithTranscript(interaction.guild, new EmbedBuilder()
-      .setTitle("Ticket geschlossen")
-      .setDescription(`<#${closed.channelId}> wurde von <@${interaction.user.id}> geschlossen.`)
-      .addFields(
-        { name: "Grund", value: reason || "Kein Grund angegeben." },
-        { name: "Transkript", value: transcriptPath ? "Wurde angehaengt und lokal gespeichert." : "Konnte nicht erstellt werden." }
-      )
-      .setColor(0xe74c3c)
-      .setTimestamp(), transcriptPath);
-
-    await createFaqDraftForClosedTicket(interaction.guild, closed);
-
-    await interaction.editReply("Ticket geschlossen.");
+    const closed = await closeTicketAndAnnounce(interaction.guild, ticket, interaction.user.id, reason);
+    await interaction.editReply(closed ? "Ticket geschlossen." : "Ticket konnte nicht gefunden werden.");
     return;
   }
 
@@ -1881,7 +1912,7 @@ async function handleTicketCommand(interaction: ChatInputCommandInteraction) {
       ReadMessageHistory: true,
       UseApplicationCommands: true
     }, "Ticket participant added");
-    await interaction.reply({ content: `<@${user.id}> wurde zum Ticket hinzugefuegt.` });
+    await interaction.reply({ content: `<@${user.id}> wurde zum Ticket hinzugefügt.` });
     return;
   }
 
@@ -1963,7 +1994,7 @@ async function handleSupportStatusCommand(interaction: ChatInputCommandInteracti
     const fallbackMessage = status === "online"
       ? "Support ist aktuell erreichbar."
       : status === "busy"
-        ? "Support ist gerade beschaeftigt, antwortet aber spaeter."
+        ? "Support ist gerade beschäftigt, antwortet aber später."
         : "Support ist aktuell offline.";
     const message = interaction.options.getString("nachricht")?.trim() || fallbackMessage;
     const state = await supportStore.set(status, message, interaction.user.id);
@@ -2191,7 +2222,7 @@ async function handleStatsSetup(interaction: ChatInputCommandInteraction) {
   }
   const plan = buildStatChannelPlan(stats);
   if (!plan.length) {
-    await interaction.editReply("Es kamen keine Bibliotheken oder Zahlen von Jellyfin zurueck.");
+    await interaction.editReply("Es kamen keine Bibliotheken oder Zahlen von Jellyfin zurück.");
     return;
   }
 
@@ -2241,7 +2272,7 @@ async function handleStatsSetup(interaction: ChatInputCommandInteraction) {
 
   await statsStore.setGuild(interaction.guild.id, { categoryId: category.id, channels });
   await interaction.editReply(
-    `Statistik-Kanaele eingerichtet: ${channels.length} gesperrte Sprachkanaele unter "${STATS_CATEGORY_NAME}". Aktualisierung alle ${config.STATS_REFRESH_MINUTES} Min (Discord limitiert Umbenennungen, daher nicht in Echtzeit).`
+    `Statistik-Kanäle eingerichtet: ${channels.length} gesperrte Sprachkanäle unter "${STATS_CATEGORY_NAME}". Aktualisierung alle ${config.STATS_REFRESH_MINUTES} Min (Discord limitiert Umbenennungen, daher nicht in Echtzeit).`
   );
 }
 
@@ -2250,11 +2281,11 @@ async function handleStatsRefresh(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
   const existing = await statsStore.getGuild(interaction.guild.id);
   if (!existing?.channels.length) {
-    await interaction.editReply("Es sind keine Statistik-Kanaele eingerichtet. Nutze zuerst /stats setup.");
+    await interaction.editReply("Es sind keine Statistik-Kanäle eingerichtet. Nutze zuerst /stats setup.");
     return;
   }
   await updateStatsForGuild(interaction.guild);
-  await interaction.editReply("Statistik-Kanaele aktualisiert (Umbenennungen koennen wegen Discord-Limits leicht verzoegert sein).");
+  await interaction.editReply("Statistik-Kanäle aktualisiert (Umbenennungen koennen wegen Discord-Limits leicht verzoegert sein).");
 }
 
 async function handleStatsRemove(interaction: ChatInputCommandInteraction) {
@@ -2262,7 +2293,7 @@ async function handleStatsRemove(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
   const existing = await statsStore.getGuild(interaction.guild.id);
   if (!existing) {
-    await interaction.editReply("Es sind keine Statistik-Kanaele eingerichtet.");
+    await interaction.editReply("Es sind keine Statistik-Kanäle eingerichtet.");
     return;
   }
   for (const entry of existing.channels) {
@@ -2274,7 +2305,7 @@ async function handleStatsRemove(interaction: ChatInputCommandInteraction) {
     await category?.delete("Jellyfin stats removed").catch(() => undefined);
   }
   await statsStore.clearGuild(interaction.guild.id);
-  await interaction.editReply("Statistik-Kanaele entfernt.");
+  await interaction.editReply("Statistik-Kanäle entfernt.");
 }
 
 const TRIAL_ROLE_NAME = "Trial";
@@ -2325,7 +2356,7 @@ async function logTrial(guild: Guild, embed: EmbedBuilder) {
 async function handleTrialCommand(interaction: ChatInputCommandInteraction) {
   if (!interaction.guild) return;
   if (!isJfaGoConfigured()) {
-    await interaction.reply({ ephemeral: true, content: "Der Testzugang ist gerade nicht verfuegbar (jfa-go ist nicht konfiguriert)." });
+    await interaction.reply({ ephemeral: true, content: "Der Testzugang ist gerade nicht verfügbar (jfa-go ist nicht konfiguriert)." });
     return;
   }
 
@@ -2365,7 +2396,7 @@ async function handleTrialCommand(interaction: ChatInputCommandInteraction) {
     `Benutzername: \`${username}\``,
     `Passwort: \`${password}\``,
     `Der Zugang laeuft ${expiryTag} automatisch ab.`,
-    "Bitte aendere dein Passwort nach dem ersten Login."
+    "Bitte ändere dein Passwort nach dem ersten Login."
   ].join("\n");
 
   let dmDelivered = true;
@@ -2467,7 +2498,7 @@ async function syncAccounts() {
     return; // safety: never treat accounts as deleted when the list can't be fetched
   }
   if (!users.length) {
-    console.error("[accounts] jfa-go lieferte 0 Benutzer trotz vorhandener Links - Cleanup uebersprungen");
+    console.error("[accounts] jfa-go lieferte 0 Benutzer trotz vorhandener Links - Cleanup übersprungen");
     return;
   }
 
@@ -2514,7 +2545,7 @@ async function handleMeinAccountCommand(interaction: ChatInputCommandInteraction
   if (!interaction.guild) return;
   const entry = await trialStore.get(interaction.guild.id, interaction.user.id);
   if (!entry) {
-    await interaction.reply({ ephemeral: true, content: "Du hast aktuell keinen verknuepften Jellyfin-Account. Nutze /trial fuer einen Testzugang." });
+    await interaction.reply({ ephemeral: true, content: "Du hast aktuell keinen verknüpften Jellyfin-Account. Nutze /trial für einen Testzugang." });
     return;
   }
   const lines = [
@@ -2531,7 +2562,7 @@ async function handleWhoisCommand(interaction: ChatInputCommandInteraction) {
   const target = interaction.options.getUser("user", true);
   const entry = await trialStore.get(interaction.guild.id, target.id);
   if (!entry) {
-    await interaction.reply({ ephemeral: true, content: `${target.tag} hat keinen verknuepften Jellyfin-Account.` });
+    await interaction.reply({ ephemeral: true, content: `${target.tag} hat keinen verknüpften Jellyfin-Account.` });
     return;
   }
   await interaction.reply({
@@ -2539,7 +2570,7 @@ async function handleWhoisCommand(interaction: ChatInputCommandInteraction) {
     content: [
       `${target.tag} -> Jellyfin \`${entry.jellyfinUsername}\``,
       `Typ: ${accountTypeLabel(entry.type)}`,
-      `Verknuepft seit: ${entry.createdAt}`
+      `Verknüpft seit: ${entry.createdAt}`
     ].join("\n")
   });
 }
@@ -2639,7 +2670,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
     .setDescription(`${member.user.tag} (${member.id})`)
     .addFields(
       { name: "Account-Alter", value: `${ageDays} Tage`, inline: true },
-      { name: "Pruefung", value: strictNew ? "Streng" : newAccount ? "Beobachten" : "Normal", inline: true },
+      { name: "Prüfung", value: strictNew ? "Streng" : newAccount ? "Beobachten" : "Normal", inline: true },
       { name: "Aktion", value: timeoutApplied ? `Timeout ${config.NEW_ACCOUNT_STRICT_TIMEOUT_MINUTES} Minuten` : "Keine", inline: true }
     )
     .setColor(0x2ecc71)
@@ -2754,6 +2785,9 @@ async function handleInteractionCreate(interaction: Interaction) {
   if (interaction.isButton()) {
     if (interaction.customId === TICKET_CREATE_BUTTON_ID) {
       await handleTicketCreateButton(interaction);
+    }
+    if (interaction.customId === TICKET_CLOSE_BUTTON_ID) {
+      await handleTicketCloseButton(interaction);
     }
     if (interaction.customId === AI_LIBRARY_SCAN_BUTTON_ID) {
       await handleLibraryScanButton(interaction);
@@ -2934,7 +2968,7 @@ async function handleInteractionCreate(interaction: Interaction) {
     await interaction.reply({
       ephemeral: true,
       content: [
-        `Stats fuer ${target.tag}`,
+        `Stats für ${target.tag}`,
         `Nachrichten: ${userStats.messages}`,
         `Warnungen: ${userStats.warnings}`,
         `Beitritte: ${userStats.joins}`,
@@ -2982,7 +3016,7 @@ async function handleInteractionCreate(interaction: Interaction) {
     await interaction.reply({
       ephemeral: true,
       embeds: [new EmbedBuilder()
-        .setTitle(`Warnungen fuer ${target.tag}`)
+        .setTitle(`Warnungen für ${target.tag}`)
         .setDescription(lines.length ? lines.join("\n") : "Keine Warnungen gefunden.")
         .addFields(
           { name: "Aktiv", value: String(activeCount), inline: true },
@@ -3037,7 +3071,7 @@ async function handleInteractionCreate(interaction: Interaction) {
       return;
     }
     await target.timeout(minutes * 60_000, reason);
-    await interaction.reply({ ephemeral: true, content: `${target.user.tag} hat einen Timeout fuer ${minutes} Minuten erhalten.` });
+    await interaction.reply({ ephemeral: true, content: `${target.user.tag} hat einen Timeout für ${minutes} Minuten erhalten.` });
     await logToDiscord(interaction.guild, new EmbedBuilder()
       .setTitle("Timeout")
       .setDescription(`${target.user.tag}: ${reason}`)
@@ -3057,7 +3091,7 @@ async function handleInteractionCreate(interaction: Interaction) {
       return;
     }
     await target.send({ content: text });
-    await interaction.reply({ ephemeral: true, content: "Ankuendigung gesendet." });
+    await interaction.reply({ ephemeral: true, content: "Ankündigung gesendet." });
     return;
   }
 

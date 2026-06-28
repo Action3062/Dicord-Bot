@@ -61,10 +61,10 @@ export async function generateAssistantReply(question: string, context: Assistan
 
   const text = await callOpenAiText({
     instructions: [
-      "Du bist HoJ, ein freundlicher deutschsprachiger Support-Bot fuer einen Jellyfin-Discord.",
+      "Du bist HoJ, ein freundlicher deutschsprachiger Support-Bot für einen Jellyfin-Discord.",
       "Antworte knapp, hilfreich und ehrlich. Maximal 1200 Zeichen.",
       "Nutze nur die bereitgestellten Fakten. Erfinde keine Jellyfin-Daten, Downloads, Zahlungen oder Teamentscheidungen.",
-      "Wenn wichtige Infos fehlen, stelle 1-3 konkrete Rueckfragen statt zu raten, zum Beispiel nach App, Geraet, Jellyfin-Name oder Fehlermeldung.",
+      "Wenn wichtige Infos fehlen, stelle 1-3 konkrete Rückfragen statt zu raten, zum Beispiel nach App, Gerät, Jellyfin-Name oder Fehlermeldung.",
       "Fordere niemals Passwoerter, Tokens, private Zahlungsdaten oder API-Keys an.",
       "Kritische Aktionen darfst du nicht selbst behaupten. Wenn ein Bibliotheksscan sinnvoll ist, sage, dass ein Teammitglied ihn per Button starten kann."
     ].join("\n"),
@@ -95,11 +95,11 @@ export async function analyzeTicketInput(input: {
   const text = await callOpenAiText({
     instructions: [
       "Analysiere ein Jellyfin-Support-Ticket.",
-      "Antworte ausschliesslich als JSON ohne Markdown.",
-      "Gueltige Kategorien:",
+      "Antworte ausschließlich als JSON ohne Markdown.",
+      "Gültige Kategorien:",
       ticketCategories.map((category) => `${category.id}: ${category.label} - ${category.description}`).join("\n"),
-      "Gueltige priorities: low, normal, high, urgent.",
-      "urgent nur bei kompletter Unerreichbarkeit, Zahlung blockiert Zugang fuer viele User, Sicherheitsproblem oder starkem Serverausfall.",
+      "Gültige priorities: low, normal, high, urgent.",
+      "urgent nur bei kompletter Unerreichbarkeit, Zahlung blockiert Zugang für viele User, Sicherheitsproblem oder starkem Serverausfall.",
       "high bei zahlungs-/zugangsrelevantem Problem oder mehreren betroffenen Usern.",
       "Stelle missingInfoQuestions nur, wenn konkrete Infos fehlen, die Support wirklich braucht.",
       "JSON-Form: {\"categoryId\":\"...\",\"priority\":\"normal\",\"priorityReason\":\"...\",\"missingInfoQuestions\":[\"...\"],\"shortSummary\":\"...\"}"
@@ -128,9 +128,9 @@ export async function generateTicketSummary(input: {
 }) {
   const text = await callOpenAiText({
     instructions: [
-      "Fasse ein Jellyfin-Support-Ticket fuer das Support-Team zusammen.",
+      "Fasse ein Jellyfin-Support-Ticket für das Support-Team zusammen.",
       "Deutsch, sachlich, maximal 1200 Zeichen.",
-      "Struktur: Kurzlage, bisher probiert, offene Fragen, naechster sinnvoller Schritt.",
+      "Struktur: Kurzlage, bisher probiert, offene Fragen, nächster sinnvoller Schritt.",
       "Erfinde nichts. Wenn etwas nicht im Verlauf steht, schreibe 'nicht genannt'."
     ].join("\n"),
     input: [
@@ -161,11 +161,11 @@ export async function generateReplySuggestion(input: {
 }) {
   const text = await callOpenAiText({
     instructions: [
-      "Schreibe einen Antwortvorschlag fuer ein Support-Team in einem Jellyfin-Ticket.",
+      "Schreibe einen Antwortvorschlag für ein Support-Team in einem Jellyfin-Ticket.",
       "Die Antwort wird noch von einem Menschen freigegeben. Antworte deshalb direkt an den User, freundlich und konkret.",
-      "Wenn Infos fehlen, stelle maximal 3 Rueckfragen.",
+      "Wenn Infos fehlen, stelle maximal 3 Rückfragen.",
       "Fordere niemals Passwoerter, Tokens, private Zahlungsdaten oder API-Keys an.",
-      "Keine Behauptungen ueber Aktionen, die nicht im Verlauf stehen. Maximal 1200 Zeichen."
+      "Keine Behauptungen über Aktionen, die nicht im Verlauf stehen. Maximal 1200 Zeichen."
     ].join("\n"),
     input: [
       {
@@ -196,10 +196,10 @@ export async function generateFaqDraft(input: {
     instructions: [
       "Erstelle aus einem geschlossenen Jellyfin-Support-Ticket einen FAQ-Entwurf.",
       "Nur wenn daraus eine wiederverwendbare, allgemeine FAQ entsteht.",
-      "Antworte ausschliesslich als JSON ohne Markdown.",
+      "Antworte ausschließlich als JSON ohne Markdown.",
       "JSON-Form: {\"title\":\"...\",\"keywords\":[\"...\"],\"answer\":\"...\"}",
       "Die Antwort darf keine Usernamen, IDs, Tokens, Zahlungsdaten oder privaten Details enthalten.",
-      "Wenn keine sinnvolle FAQ moeglich ist: {\"title\":\"\",\"keywords\":[],\"answer\":\"\"}"
+      "Wenn keine sinnvolle FAQ möglich ist: {\"title\":\"\",\"keywords\":[],\"answer\":\"\"}"
     ].join("\n"),
     input: [
       {
@@ -274,7 +274,7 @@ function buildContextPayload(context: AssistantContext) {
         typ: item.Type ?? "Unbekannt",
         jahr: item.ProductionYear ?? "",
         premiere: item.PremiereDate ?? "",
-        hinzugefuegt: item.DateCreated ?? ""
+        hinzugefügt: item.DateCreated ?? ""
       }))
     },
     zahlungsseite: context.paymentUrl,
@@ -345,8 +345,8 @@ function fallbackTicketAnalysis(input: {
     ? "high"
     : "normal";
   const missingInfoQuestions = [];
-  if (/\b(stream|ruckelt|buffer|app|login|fehler|problem|geht nicht)\b/.test(text) && !/\b(android|ios|tv|browser|fire|app|geraet|gerät)\b/.test(text)) {
-    missingInfoQuestions.push("Welche App und welches Geraet nutzt du?");
+  if (/\b(stream|ruckelt|buffer|app|login|fehler|problem|geht nicht)\b/.test(text) && !/\b(android|ios|tv|browser|fire|app|gerät|gerät)\b/.test(text)) {
+    missingInfoQuestions.push("Welche App und welches Gerät nutzt du?");
   }
   if (/\b(login|zugang|account|zahlung)\b/.test(text) && !/\bname|username|benutzer\b/.test(text)) {
     missingInfoQuestions.push("Wie lautet dein Jellyfin-Benutzername?");

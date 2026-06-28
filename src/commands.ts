@@ -11,7 +11,7 @@ export const commandBuilders = [
     .setDescription("Zeigt API- und Jellyfin-Status."),
   new SlashCommandBuilder()
     .setName("usercheck")
-    .setDescription("Prueft, ob ein Jellyfin-Benutzer existiert.")
+    .setDescription("Prüft, ob ein Jellyfin-Benutzer existiert.")
     .addStringOption((option) => option
       .setName("username")
       .setDescription("Jellyfin-Benutzername")
@@ -32,12 +32,12 @@ export const commandBuilders = [
     .setDescription("Fragt den Jellyfin-Assistenten.")
     .addStringOption((option) => option
       .setName("frage")
-      .setDescription("Was soll der Bot pruefen oder beantworten?")
+      .setDescription("Was soll der Bot prüfen oder beantworten?")
       .setMaxLength(800)
       .setRequired(true)),
   new SlashCommandBuilder()
     .setName("ticket")
-    .setDescription("Oeffnet und verwaltet Support-Tickets.")
+    .setDescription("Öffnet und verwaltet Support-Tickets.")
     .addSubcommand((subcommand) => subcommand
       .setName("create")
       .setDescription("Erstellt ein privates Support-Ticket.")
@@ -63,7 +63,7 @@ export const commandBuilders = [
         .setRequired(false)))
     .addSubcommand((subcommand) => subcommand
       .setName("close")
-      .setDescription("Schliesst das aktuelle Ticket.")
+      .setDescription("Schließt das aktuelle Ticket.")
       .addStringOption((option) => option
         .setName("grund")
         .setDescription("Optional: Grund")
@@ -71,7 +71,7 @@ export const commandBuilders = [
         .setRequired(false)))
     .addSubcommand((subcommand) => subcommand
       .setName("add")
-      .setDescription("Fuegt einen User zum aktuellen Ticket hinzu.")
+      .setDescription("Fügt einen User zum aktuellen Ticket hinzu.")
       .addUserOption((option) => option
         .setName("user")
         .setDescription("User")
@@ -85,28 +85,28 @@ export const commandBuilders = [
         .setRequired(true)))
     .addSubcommand((subcommand) => subcommand
       .setName("list")
-      .setDescription("Listet offene Tickets fuer das Team."))
+      .setDescription("Listet offene Tickets für das Team."))
     .addSubcommand((subcommand) => subcommand
       .setName("summary")
       .setDescription("Erstellt eine AI-Zusammenfassung des aktuellen Tickets."))
     .addSubcommand((subcommand) => subcommand
       .setName("suggest")
-      .setDescription("Erstellt einen AI-Antwortvorschlag fuer das aktuelle Ticket.")),
+      .setDescription("Erstellt einen AI-Antwortvorschlag für das aktuelle Ticket.")),
   new SlashCommandBuilder()
     .setName("support-status")
-    .setDescription("Zeigt oder setzt die Support-Verfuegbarkeit.")
+    .setDescription("Zeigt oder setzt die Support-Verfügbarkeit.")
     .addSubcommand((subcommand) => subcommand
       .setName("view")
-      .setDescription("Zeigt die aktuelle Support-Verfuegbarkeit."))
+      .setDescription("Zeigt die aktuelle Support-Verfügbarkeit."))
     .addSubcommand((subcommand) => subcommand
       .setName("set")
-      .setDescription("Setzt die Support-Verfuegbarkeit fuer den Server.")
+      .setDescription("Setzt die Support-Verfügbarkeit für den Server.")
       .addStringOption((option) => option
         .setName("status")
         .setDescription("Aktueller Status")
         .addChoices(
           { name: "Online", value: "online" },
-          { name: "Beschaeftigt", value: "busy" },
+          { name: "Beschäftigt", value: "busy" },
           { name: "Offline", value: "offline" }
         )
         .setRequired(true))
@@ -120,29 +120,29 @@ export const commandBuilders = [
     .setDescription("Aktivitaets- und Jellyfin-Bibliotheks-Statistiken.")
     .addSubcommand((subcommand) => subcommand
       .setName("activity")
-      .setDescription("Zeigt Aktivitaetsdaten fuer dich oder einen User.")
+      .setDescription("Zeigt Aktivitaetsdaten für dich oder einen User.")
       .addUserOption((option) => option
         .setName("user")
         .setDescription("User")
         .setRequired(false)))
     .addSubcommand((subcommand) => subcommand
       .setName("setup")
-      .setDescription("Erstellt/aktualisiert die Jellyfin-Statistik-Sprachkanaele."))
+      .setDescription("Erstellt/aktualisiert die Jellyfin-Statistik-Sprachkanäle."))
     .addSubcommand((subcommand) => subcommand
       .setName("refresh")
-      .setDescription("Aktualisiert die Statistik-Kanaele sofort."))
+      .setDescription("Aktualisiert die Statistik-Kanäle sofort."))
     .addSubcommand((subcommand) => subcommand
       .setName("remove")
-      .setDescription("Entfernt die Statistik-Kanaele wieder.")),
+      .setDescription("Entfernt die Statistik-Kanäle wieder.")),
   new SlashCommandBuilder()
     .setName("trial")
     .setDescription("Erstellt dir einen zeitlich begrenzten Jellyfin-Testzugang."),
   new SlashCommandBuilder()
     .setName("meinaccount")
-    .setDescription("Zeigt deinen verknuepften Jellyfin-Account und Status."),
+    .setDescription("Zeigt deinen verknüpften Jellyfin-Account und Status."),
   new SlashCommandBuilder()
     .setName("whois")
-    .setDescription("Zeigt den verknuepften Jellyfin-Account eines Users (Team).")
+    .setDescription("Zeigt den verknüpften Jellyfin-Account eines Users (Team).")
     .addUserOption((option) => option
       .setName("user")
       .setDescription("User")
@@ -185,12 +185,12 @@ export const commandBuilders = [
       .setRequired(false))
     .addStringOption((option) => option
       .setName("grund")
-      .setDescription("Optional: Grund fuer die Ruecknahme")
+      .setDescription("Optional: Grund für die Rücknahme")
       .setMaxLength(240)
       .setRequired(false)),
   new SlashCommandBuilder()
     .setName("timeout")
-    .setDescription("Setzt einen Discord-Timeout fuer einen User.")
+    .setDescription("Setzt einen Discord-Timeout für einen User.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
     .addUserOption((option) => option
       .setName("user")
@@ -208,7 +208,7 @@ export const commandBuilders = [
       .setRequired(false)),
   new SlashCommandBuilder()
     .setName("announce")
-    .setDescription("Sendet eine Ankuendigung in einen Textkanal.")
+    .setDescription("Sendet eine Ankündigung in einen Textkanal.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
     .addChannelOption((option) => option
       .setName("kanal")
@@ -221,11 +221,11 @@ export const commandBuilders = [
       .setRequired(true)),
   new SlashCommandBuilder()
     .setName("setup")
-    .setDescription("Erstellt Standard-Kanaele und Rollen fuer den Jellyfin-Discord.")
+    .setDescription("Erstellt Standard-Kanäle und Rollen für den Jellyfin-Discord.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
     .setName("serveraufbau")
-    .setDescription("Baut die komplette Byteflix-Serverstruktur (Rollen, Kanaele, Rechte) auf.")
+    .setDescription("Baut die komplette Byteflix-Serverstruktur (Rollen, Kanäle, Rechte) auf.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
 ];
 

@@ -8,27 +8,27 @@ export const faqItems: FaqItem[] = [
   {
     title: "Jellyfin Zugang",
     keywords: ["zugang", "account", "jellyfin", "login", "einloggen", "freischalten"],
-    answer: "Fuer Jellyfin brauchst du einen aktiven Benutzer. Nutze /usercheck, um deinen Namen zu pruefen, und /payment-link fuer die Zahlungsseite."
+    answer: "Für Jellyfin brauchst du einen aktiven Benutzer. Nutze /usercheck, um deinen Namen zu prüfen, und /payment-link für die Zahlungsseite."
   },
   {
     title: "Zahlung",
     keywords: ["zahlung", "bezahlen", "crypto", "bitcoin", "azteco", "rechnung", "invoice"],
-    answer: "Zahlungen laufen ueber die Zahlungsseite. Nach einer bestaetigten Zahlung verlaengert die API den Jellyfin-Zugang automatisch."
+    answer: "Zahlungen laufen über die Zahlungsseite. Nach einer bestätigten Zahlung verlaengert die API den Jellyfin-Zugang automatisch."
   },
   {
     title: "Support",
     keywords: ["support", "hilfe", "problem", "fehler", "geht nicht", "kaputt"],
-    answer: "Beschreibe bitte kurz dein Geraet, die App, deinen Jellyfin-Benutzernamen und was genau passiert. Ein Support-Mitglied schaut dann rein."
+    answer: "Beschreibe bitte kurz dein Gerät, die App, deinen Jellyfin-Benutzernamen und was genau passiert. Ein Support-Mitglied schaut dann rein."
   },
   {
     title: "Passwort",
     keywords: ["passwort", "password", "reset", "vergessen"],
-    answer: "Wenn dein Passwort nicht mehr geht, oeffne ein Support-Ticket oder markiere das Support-Team. Teile dein Passwort niemals im Chat."
+    answer: "Wenn dein Passwort nicht mehr geht, öffne ein Support-Ticket oder markiere das Support-Team. Teile dein Passwort niemals im Chat."
   },
   {
     title: "Streams",
     keywords: ["stream", "buffer", "ruckelt", "transcoding", "quality", "qualitaet"],
-    answer: "Wenn Streams ruckeln, teste zuerst eine niedrigere Qualitaet oder eine offizielle Jellyfin-App. Nenne dem Support danach Geraet, App und Titel."
+    answer: "Wenn Streams ruckeln, teste zuerst eine niedrigere Qualitaet oder eine offizielle Jellyfin-App. Nenne dem Support danach Gerät, App und Titel."
   }
 ];
 

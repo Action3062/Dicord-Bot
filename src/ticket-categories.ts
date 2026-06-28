@@ -31,7 +31,7 @@ export const ticketCategories = [
     id: "medienwunsch",
     label: "Medienwunsch",
     channelPrefix: "wunsch",
-    description: "Wuensche fuer Filme, Serien oder Kategorien.",
+    description: "Wuensche für Filme, Serien oder Kategorien.",
     keywords: ["wunsch", "film", "serie", "staffel", "medien", "request"]
   },
   {
