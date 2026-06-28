@@ -2052,7 +2052,10 @@ async function handleServerAufbauCommand(interaction: ChatInputCommandInteractio
     : "Byteflix-Aufbau fertig - alles war bereits vorhanden (Rechte/Topics wurden aktualisiert).";
   const body = result.summary.slice(0, 40).join("\n");
   const extra = result.summary.length > 40 ? `\n… und ${result.summary.length - 40} weitere.` : "";
-  await interaction.editReply(`${header}\n${body}${extra}`.slice(0, 1900));
+  const warn = result.failures.length
+    ? `\n\n⚠️ ${result.failures.length} Problem(e):\n${result.failures.slice(0, 8).join("\n")}`
+    : "";
+  await interaction.editReply(`${header}\n${body}${extra}${warn}`.slice(0, 1900));
 }
 
 const STATS_CATEGORY_NAME = "📊 Jellyfin Stats";

@@ -297,17 +297,22 @@ async function ensureRole(guild: Guild, setupStore: SetupStore, def: RoleDef) {
   if (!role) role = guild.roles.cache.find((item) => item.name.toLowerCase() === def.name.toLowerCase()) ?? null;
 
   let created = false;
+  let degraded = false;
   if (!role) {
-    role = await guild.roles.create({
-      name: def.name,
-      color: def.color,
-      permissions: def.administrator ? [PermissionFlagsBits.Administrator] : def.permissions ?? [],
-      reason: "Byteflix setup"
-    });
-    created = true;
+    const permissions = def.administrator ? [PermissionFlagsBits.Administrator] : def.permissions ?? [];
+    role = await guild.roles.create({ name: def.name, color: def.color, permissions, reason: "Byteflix setup" }).catch(() => null);
+    if (!role) {
+      // A bot cannot grant a permission it does not hold itself (needs Administrator).
+      // Fall back to creating the role without permissions so the build still completes.
+      role = await guild.roles
+        .create({ name: def.name, color: def.color, permissions: [], reason: "Byteflix setup (ohne Rechte)" })
+        .catch(() => null);
+      degraded = Boolean(role);
+    }
+    created = Boolean(role);
   }
-  await setupStore.setId(guild.id, key, role.id);
-  return { id: role.id, created };
+  if (role) await setupStore.setId(guild.id, key, role.id);
+  return { id: role?.id, created, degraded };
 }
 
 async function ensureCategory(guild: Guild, setupStore: SetupStore, def: CategoryDef) {
@@ -378,31 +383,54 @@ async function ensureChannel(
 // ---------------------------------------------------------------------------
 export type ByteflixSetupResult = {
   summary: string[];
+  failures: string[];
   channelIdByKey: Map<string, string>;
 };
 
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : "Unbekannter Fehler";
+}
+
 export async function buildByteflixServer(guild: Guild, setupStore: SetupStore): Promise<ByteflixSetupResult> {
   const summary: string[] = [];
+  const failures: string[] = [];
   const everyoneId = guild.roles.everyone.id;
   const channelIdByKey = new Map<string, string>();
 
   const roleIds = new Map<string, string>();
   for (const def of ROLES) {
-    const { id, created } = await ensureRole(guild, setupStore, def);
-    roleIds.set(def.key, id);
-    if (created) summary.push(`Rolle: ${def.name}`);
-  }
-
-  for (const cat of STRUCTURE) {
-    const { category, created } = await ensureCategory(guild, setupStore, cat);
-    if (created) summary.push(`Kategorie: ${cat.name}`);
-    for (const def of cat.channels) {
-      const result = await ensureChannel(guild, setupStore, category.id, def, roleIds, everyoneId);
-      channelIdByKey.set(def.key, result.channel.id);
-      if (result.created) summary.push(`Kanal: ${def.name}`);
-      if (def.embed) await postEmbedOnce(result.channel, def.embed);
+    try {
+      const { id, created, degraded } = await ensureRole(guild, setupStore, def);
+      if (id) roleIds.set(def.key, id);
+      if (created) summary.push(`Rolle: ${def.name}${degraded ? " (ohne Rechte)" : ""}`);
+      if (!id) failures.push(`Rolle ${def.name} konnte nicht erstellt werden (Bot-Rechte?)`);
+      else if (degraded) failures.push(`Rolle ${def.name} ohne Rechte angelegt - Bot braucht Administrator`);
+    } catch (error) {
+      failures.push(`Rolle ${def.name}: ${errorText(error)}`);
     }
   }
 
-  return { summary, channelIdByKey };
+  for (const cat of STRUCTURE) {
+    let categoryId: string;
+    try {
+      const { category, created } = await ensureCategory(guild, setupStore, cat);
+      categoryId = category.id;
+      if (created) summary.push(`Kategorie: ${cat.name}`);
+    } catch (error) {
+      failures.push(`Kategorie ${cat.name}: ${errorText(error)}`);
+      continue;
+    }
+    for (const def of cat.channels) {
+      try {
+        const result = await ensureChannel(guild, setupStore, categoryId, def, roleIds, everyoneId);
+        channelIdByKey.set(def.key, result.channel.id);
+        if (result.created) summary.push(`Kanal: ${def.name}`);
+        if (def.embed) await postEmbedOnce(result.channel, def.embed);
+      } catch (error) {
+        failures.push(`Kanal ${def.name}: ${errorText(error)}`);
+      }
+    }
+  }
+
+  return { summary, failures, channelIdByKey };
 }
