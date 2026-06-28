@@ -662,11 +662,19 @@ async function handleScamPhraseMessage(message: Message) {
   return true;
 }
 
+// Members (and above) may post links; only users without a member-level role are filtered.
+function memberHasMemberStatus(member: GuildMember) {
+  if (config.DISCORD_MEMBER_ROLE_ID && member.roles.cache.has(config.DISCORD_MEMBER_ROLE_ID)) return true;
+  const markers = ["mitglied", "trial", "abonnent", "premium"];
+  return member.roles.cache.some((role) => markers.some((marker) => role.name.toLowerCase().includes(marker)));
+}
+
 async function handleLinkFilterMessage(message: Message) {
   if (!config.ENABLE_LINK_FILTER || !message.guild) return false;
   if (!messageHasBlockedLink(message.content)) return false;
   const member = await moderationMember(message);
   if (!member) return false; // team/mods are exempt
+  if (memberHasMemberStatus(member)) return false; // members and above may post links
   await message.delete().catch(() => undefined);
   if (canWarnForRule(message.author.id, "link_filter") && canSend(message.channel)) {
     const notice = await (message.channel as TextChannel)
