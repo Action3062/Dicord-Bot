@@ -32,7 +32,7 @@ import { commands } from "./commands.js";
 import { config } from "./config.js";
 import { answerQuestion, listFaqTopics, searchFaqItems } from "./faq.js";
 import { FaqStore } from "./faq-store.js";
-import { checkPortalUser, getActiveSessionCount, getJellyfinInfo, getJellyfinLibraryStats, getPortalHealth, refreshJellyfinLibrary, searchJellyfinMedia, type JellyfinLibraryStats } from "./jellyfin.js";
+import { checkJellyfinUser, getActiveSessionCount, getJellyfinInfo, getJellyfinLibraryStats, refreshJellyfinLibrary, searchJellyfinMedia, type JellyfinLibraryStats } from "./jellyfin.js";
 import {
   analyzeTicketInput,
   generateAssistantReply,
@@ -830,8 +830,7 @@ async function buildAssistantContext(options: {
   question: string;
 }) {
   const mediaQuery = extractMediaQuery(options.question);
-  const [portal, jellyfin, sessions, supportState, ticket, media, faqTopics] = await Promise.allSettled([
-    getPortalHealth(),
+  const [jellyfin, sessions, supportState, ticket, media, faqTopics] = await Promise.allSettled([
     getJellyfinInfo(),
     getActiveSessionCount(),
     supportStore.get(),
@@ -853,8 +852,6 @@ async function buildAssistantContext(options: {
     supportStatus: supportValue
       ? `${supportStatusLabel(supportValue.status)}: ${supportValue.message}`
       : "Unbekannt",
-    portalStatus: settledStatus(portal, (value) =>
-      value.ok ? `Online (${value.shop ?? "Shop"})` : "Nicht erreichbar", "Nicht erreichbar"),
     jellyfinStatus: settledStatus(jellyfin, (value) =>
       value.configured
         ? `${value.info.ServerName ?? "Jellyfin"} ${value.info.Version ?? ""}`.trim()
@@ -2818,8 +2815,7 @@ async function handleInteractionCreate(interaction: Interaction) {
 
   if (interaction.commandName === "status") {
     await interaction.deferReply();
-    const [portal, jellyfin, sessions] = await Promise.allSettled([
-      getPortalHealth(),
+    const [jellyfin, sessions] = await Promise.allSettled([
       getJellyfinInfo(),
       getActiveSessionCount()
     ]);
@@ -2828,10 +2824,6 @@ async function handleInteractionCreate(interaction: Interaction) {
       .setTitle("Jellyfin Status")
       .setColor(0x3498db)
       .addFields({
-        name: "Portal API",
-        value: portal.status === "fulfilled" && portal.value.ok ? `Online (${portal.value.shop ?? "Shop"})` : "Nicht erreichbar",
-        inline: true
-      }, {
         name: "Jellyfin",
         value: jellyfin.status === "fulfilled" && jellyfin.value.configured
           ? `${jellyfin.value.info.ServerName ?? "Server"} ${jellyfin.value.info.Version ?? ""}`.trim()
@@ -2851,7 +2843,11 @@ async function handleInteractionCreate(interaction: Interaction) {
     const username = interaction.options.getString("username", true).trim();
     await interaction.deferReply({ ephemeral: true });
     try {
-      const result = await checkPortalUser(username);
+      const result = await checkJellyfinUser(username);
+      if (!result.configured) {
+        await interaction.editReply("Die Jellyfin-API ist nicht konfiguriert, daher kann ich den Benutzer gerade nicht prüfen.");
+        return;
+      }
       await interaction.editReply(result.exists
         ? `Der Jellyfin-Benutzer "${username}" wurde gefunden.`
         : `Der Jellyfin-Benutzer "${username}" wurde nicht gefunden.`);

@@ -4,11 +4,6 @@ import { config } from "./config.js";
 // command handler indefinitely.
 const REQUEST_TIMEOUT_MS = 10_000;
 
-type PortalHealth = {
-  ok?: boolean;
-  shop?: string;
-};
-
 type JellyfinInfo = {
   ServerName?: string;
   Version?: string;
@@ -43,19 +38,24 @@ async function fetchJson<T>(url: string, init?: RequestInit) {
   return response.json() as Promise<T>;
 }
 
-export async function getPortalHealth() {
-  return fetchJson<PortalHealth>(`${trimTrailingSlash(config.API_PUBLIC_BASE_URL)}/health`);
-}
+type JellyfinUser = {
+  Name?: string;
+  Id?: string;
+};
 
-export async function checkPortalUser(username: string) {
-  const response = await fetch(`${trimTrailingSlash(config.API_PUBLIC_BASE_URL)}/pay/api/user/check`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+// Checks a username directly against the Jellyfin server (the bot already holds
+// an admin API key), replacing the removed shop/portal user-check endpoint.
+export async function checkJellyfinUser(username: string): Promise<{ configured: boolean; exists: boolean }> {
+  if (!config.JELLYFIN_BASE_URL || !config.JELLYFIN_API_KEY) {
+    return { configured: false, exists: false };
+  }
+  const base = trimTrailingSlash(config.JELLYFIN_BASE_URL);
+  const users = await fetchJson<JellyfinUser[]>(`${base}/Users`, {
+    headers: { "X-Emby-Token": config.JELLYFIN_API_KEY }
   });
-  if (!response.ok) throw new Error(`User-Check fehlgeschlagen: ${response.status}`);
-  return response.json() as Promise<{ exists: boolean }>;
+  const needle = username.trim().toLowerCase();
+  const exists = users.some((user) => (user.Name ?? "").trim().toLowerCase() === needle);
+  return { configured: true, exists };
 }
 
 export async function getJellyfinInfo() {

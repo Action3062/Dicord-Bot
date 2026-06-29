@@ -27,7 +27,6 @@ const schema = z.object({
   DISCORD_TICKET_ARCHIVE_CATEGORY_ID: z.string().default(""),
   DISCORD_TICKET_LOG_CHANNEL_ID: z.string().default(""),
   PUBLIC_BASE_URL: z.string().url().default("http://localhost:3000"),
-  API_PUBLIC_BASE_URL: z.string().url().default("http://localhost:4000"),
   JELLYFIN_BASE_URL: z.string().default(""),
   JELLYFIN_PUBLIC_URL: z.string().default(""),
   JELLYFIN_API_KEY: z.string().default(""),

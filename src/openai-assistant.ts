@@ -29,7 +29,6 @@ export type AssistantContext = {
   isTicketChannel: boolean;
   ticketSubject?: string;
   supportStatus: string;
-  portalStatus: string;
   jellyfinStatus: string;
   activeSessions?: number;
   mediaQuery?: string;
@@ -263,7 +262,6 @@ function buildContextPayload(context: AssistantContext) {
       ? { aktiv: true, thema: context.ticketSubject ?? "Unbekannt" }
       : { aktiv: false },
     supportStatus: context.supportStatus,
-    portalStatus: context.portalStatus,
     jellyfinStatus: context.jellyfinStatus,
     aktiveSessions: context.activeSessions ?? "unbekannt",
     medienSuche: {
