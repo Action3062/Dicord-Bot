@@ -11,11 +11,16 @@ export const commandBuilders = [
     .setDescription("Zeigt API- und Jellyfin-Status."),
   new SlashCommandBuilder()
     .setName("usercheck")
-    .setDescription("Prüft, ob ein Jellyfin-Benutzer existiert.")
+    .setDescription("Zeigt die Verknüpfung zwischen Discord-Nutzer und Jellyfin-Account (Team).")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((option) => option
+      .setName("user")
+      .setDescription("Discord-Nutzer")
+      .setRequired(false))
     .addStringOption((option) => option
       .setName("username")
-      .setDescription("Jellyfin-Benutzername")
-      .setRequired(true)),
+      .setDescription("Jellyfin-Benutzername (Rückwärtssuche)")
+      .setRequired(false)),
   new SlashCommandBuilder()
     .setName("faq")
     .setDescription("Beantwortet typische Fragen.")

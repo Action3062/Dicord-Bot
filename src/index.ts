@@ -50,7 +50,7 @@ import { SupportStore, type SupportStatus } from "./support-store.js";
 import { getTicketCategory, inferTicketCategory } from "./ticket-categories.js";
 import { TicketStore, type Ticket } from "./ticket-store.js";
 import { StatsStore, type StatsChannelEntry, type StatsChannelKind } from "./stats-store.js";
-import { TrialStore } from "./trial-store.js";
+import { TrialStore, type TrialEntry } from "./trial-store.js";
 import { SetupStore } from "./setup-store.js";
 import { buildByteflixServer } from "./byteflix-setup.js";
 import { createTrialAccount, isJfaGoConfigured, listJfaGoUsers } from "./jfago.js";
@@ -2479,7 +2479,7 @@ function memberHasSubscription(member: GuildMember) {
 }
 
 function accountTypeLabel(type?: string) {
-  return type === "extended" ? "Abo/Verlaengert" : "Trial";
+  return type === "extended" ? "Abo/Verlängert" : "Trial";
 }
 
 async function syncAccounts() {
@@ -2570,6 +2570,70 @@ async function handleWhoisCommand(interaction: ChatInputCommandInteraction) {
       `Verknüpft seit: ${entry.createdAt}`
     ].join("\n")
   });
+}
+
+// Team lookup that shows the full Discord <-> Jellyfin link the bot logged when
+// the account was created. Resolves from either side (Discord user or Jellyfin
+// username) and cross-checks whether the account still exists on Jellyfin.
+async function handleUserCheckCommand(interaction: ChatInputCommandInteraction) {
+  if (!interaction.guild) return;
+  if (!(await ensureCommandPermission(interaction, isModerator))) return;
+  const guildId = interaction.guild.id;
+  const targetUser = interaction.options.getUser("user", false);
+  const usernameInput = interaction.options.getString("username", false)?.trim();
+  if (!targetUser && !usernameInput) {
+    await interaction.reply({ ephemeral: true, content: "Bitte gib einen Discord-Nutzer oder einen Jellyfin-Benutzernamen an." });
+    return;
+  }
+  await interaction.deferReply({ ephemeral: true });
+
+  let entry: TrialEntry | undefined;
+  if (targetUser) {
+    entry = await trialStore.get(guildId, targetUser.id);
+  } else if (usernameInput) {
+    const needle = usernameInput.toLowerCase();
+    const all = await trialStore.allEntries();
+    const match = all.find(({ guildId: g, entry: e }) => g === guildId && e.jellyfinUsername.toLowerCase() === needle)
+      ?? all.find(({ entry: e }) => e.jellyfinUsername.toLowerCase() === needle);
+    entry = match?.entry;
+  }
+
+  // Verify the account still exists on the live Jellyfin server.
+  const jellyfinUsername = entry?.jellyfinUsername ?? usernameInput;
+  let liveStatus = "";
+  if (jellyfinUsername) {
+    try {
+      const live = await checkJellyfinUser(jellyfinUsername);
+      liveStatus = !live.configured
+        ? "Jellyfin-API nicht konfiguriert"
+        : live.exists
+          ? "auf Jellyfin vorhanden"
+          : "auf Jellyfin nicht vorhanden";
+    } catch {
+      liveStatus = "Jellyfin nicht erreichbar";
+    }
+  }
+
+  if (!entry) {
+    const lines = targetUser
+      ? [`${targetUser.tag} hat keinen vom Bot verknüpften Jellyfin-Account.`]
+      : [`Keine Bot-Verknüpfung für Jellyfin-Benutzer \`${usernameInput}\` gefunden.`];
+    if (liveStatus) lines.push(`Jellyfin-Status: ${liveStatus}`);
+    await interaction.editReply(lines.join("\n"));
+    return;
+  }
+
+  const linkedUser = targetUser ?? await interaction.client.users.fetch(entry.userId).catch(() => null);
+  const discordLabel = linkedUser ? `${linkedUser} (${linkedUser.tag})` : `<@${entry.userId}> (ID ${entry.userId})`;
+  const lines = [
+    `Discord: ${discordLabel}`,
+    `Jellyfin-Benutzer: \`${entry.jellyfinUsername}\``,
+    `Typ: ${accountTypeLabel(entry.type)}`,
+    `Verknüpft seit: ${entry.createdAt}`
+  ];
+  if (liveStatus) lines.push(`Jellyfin-Status: ${liveStatus}`);
+  if (entry.type !== "extended") lines.push(`Trial läuft ab: <t:${Math.floor(entry.expiresAt / 1000)}:R>`);
+  await interaction.editReply(lines.join("\n"));
 }
 
 function pruneEphemeralState() {
@@ -2840,30 +2904,7 @@ async function handleInteractionCreate(interaction: Interaction) {
   }
 
   if (interaction.commandName === "usercheck") {
-    const username = interaction.options.getString("username", true).trim();
-    await interaction.deferReply({ ephemeral: true });
-    try {
-      const result = await checkJellyfinUser(username);
-      if (!result.configured) {
-        await interaction.editReply("Die Jellyfin-API ist nicht konfiguriert, daher kann ich den Benutzer gerade nicht prüfen.");
-        return;
-      }
-      await interaction.editReply(result.exists
-        ? `Der Jellyfin-Benutzer "${username}" wurde gefunden.`
-        : `Der Jellyfin-Benutzer "${username}" wurde nicht gefunden.`);
-    } catch (error) {
-      await logErrorToDiscord({
-        guild: interaction.guild,
-        title: "User-Check fehlgeschlagen",
-        error,
-        context: {
-          user: interaction.user.tag,
-          userId: interaction.user.id,
-          username
-        }
-      });
-      await interaction.editReply(`User-Check fehlgeschlagen: ${error instanceof Error ? error.message : "Unbekannter Fehler"}`);
-    }
+    await handleUserCheckCommand(interaction);
     return;
   }
 
