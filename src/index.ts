@@ -2452,6 +2452,7 @@ async function expireTrials() {
 
 const ABO_ROLE_NAME = "Abo";
 const PREMIUM_ROLE_NAME = "Premium Abo";
+const MEMBER_ROLE_NAME = "Mitglied";
 // Trials run TRIAL_HOURS (default 26). An account whose live jfa-go expiry is well
 // beyond that has been upgraded (paid) and must not be treated as a trial anymore.
 const EXTENDED_THRESHOLD_MS = 30 * 60 * 60_000;
@@ -2476,6 +2477,49 @@ function memberHasSubscription(member: GuildMember) {
   const names = [ABO_ROLE_NAME.toLowerCase(), PREMIUM_ROLE_NAME.toLowerCase()];
   const ids = [config.DISCORD_ABO_ROLE_ID, config.DISCORD_PREMIUM_ROLE_ID].filter(Boolean);
   return member.roles.cache.some((role) => ids.includes(role.id) || names.includes(role.name.toLowerCase()));
+}
+
+// Like resolveManagedRole, but never creates a role - used when we only want to
+// remove an existing role and must not accidentally create it as a side effect.
+async function findManagedRole(guild: Guild, configuredId: string, name: string) {
+  if (configuredId) {
+    const byId = guild.roles.cache.get(configuredId) ?? await guild.roles.fetch(configuredId).catch(() => null);
+    if (byId) return byId;
+  }
+  return guild.roles.cache.find((role) => role.name.toLowerCase() === name.toLowerCase()) ?? null;
+}
+
+// Upgrade a paid/topped-up account: grant Mitglied (kept permanently once paid)
+// and Abo, and drop the Trial role. Idempotent - safe to run every sync.
+async function applyUpgradeRoles(guild: Guild, member: GuildMember, trialRoleId?: string) {
+  const memberRole = await resolveManagedRole(guild, config.DISCORD_MEMBER_ROLE_ID, MEMBER_ROLE_NAME);
+  if (memberRole && !member.roles.cache.has(memberRole.id)) {
+    await member.roles.add(memberRole, "Account hochgestuft (bezahlt)").catch(() => undefined);
+  }
+  const aboRole = await resolveManagedRole(guild, config.DISCORD_ABO_ROLE_ID, ABO_ROLE_NAME);
+  if (aboRole && !member.roles.cache.has(aboRole.id)) {
+    await member.roles.add(aboRole, "Abo aktiv").catch(() => undefined);
+  }
+  const trialRole = await findManagedRole(guild, config.DISCORD_TRIAL_ROLE_ID, TRIAL_ROLE_NAME);
+  for (const roleId of [trialRoleId, trialRole?.id]) {
+    if (roleId && member.roles.cache.has(roleId)) {
+      await member.roles.remove(roleId, "Account hochgestuft").catch(() => undefined);
+    }
+  }
+}
+
+// Subscription ended: remove Abo + Premium, but keep Mitglied (already paid once).
+async function removeSubscriptionRoles(guild: Guild, member: GuildMember) {
+  const subscriptionRoles: Array<readonly [string, string]> = [
+    [config.DISCORD_ABO_ROLE_ID, ABO_ROLE_NAME],
+    [config.DISCORD_PREMIUM_ROLE_ID, PREMIUM_ROLE_NAME]
+  ];
+  for (const [configuredId, name] of subscriptionRoles) {
+    const role = await findManagedRole(guild, configuredId, name);
+    if (role && member.roles.cache.has(role.id)) {
+      await member.roles.remove(role, "Abo abgelaufen").catch(() => undefined);
+    }
+  }
 }
 
 function accountTypeLabel(type?: string) {
@@ -2506,34 +2550,43 @@ async function syncAccounts() {
     const guild = client.guilds.cache.get(guildId);
     if (!guild) continue;
     const jfaUser = byName.get(entry.jellyfinUsername.toLowerCase());
+    const member = await guild.members.fetch(entry.userId).catch(() => null);
 
-    if (!jfaUser) {
-      // Account no longer exists in jfa-go (expiry/inactivity deletion).
-      const member = await guild.members.fetch(entry.userId).catch(() => null);
-      const subscriber = member ? memberHasSubscription(member) : false;
-      if (member && entry.roleId) await member.roles.remove(entry.roleId, "Account entfernt").catch(() => undefined);
-      if (subscriber && member) {
-        await member.send("Dein Jellyfin-Account wurde wegen Inaktivitaet entfernt. Melde dich beim Team, um ihn wiederherzustellen.").catch(() => undefined);
+    // The account counts as ended when jfa-go deleted it, disabled it, or its
+    // expiry is in the past (jfa-go deletes trials at user-expiry).
+    const expiryMs = jfaUser && jfaUser.expiry > 0 ? jfaUser.expiry * 1000 : Number.POSITIVE_INFINITY;
+    const ended = !jfaUser || jfaUser.disabled || expiryMs <= now;
+
+    if (ended) {
+      // "Paid once" if the bot ever classified the account as extended, or the
+      // member still carries a subscription role.
+      const wasPaid = entry.type === "extended" || (member ? memberHasSubscription(member) : false);
+      if (member) {
+        if (wasPaid) {
+          // Subscription ended: drop Abo/Premium, but keep Mitglied (paid once).
+          await removeSubscriptionRoles(guild, member);
+          await member.send("Dein Jellyfin-Abo ist abgelaufen. Deine Mitglied-Rolle bleibt erhalten - melde dich beim Team, wenn du verlängern möchtest.").catch(() => undefined);
+        } else if (entry.roleId && member.roles.cache.has(entry.roleId)) {
+          // Pure trial that ended: remove the Trial role.
+          await member.roles.remove(entry.roleId, "Trial beendet").catch(() => undefined);
+        }
       }
       await logTrial(guild, new EmbedBuilder()
-        .setTitle("Account entfernt")
-        .setDescription(`<@${entry.userId}> - Jellyfin-Account \`${entry.jellyfinUsername}\` existiert nicht mehr.`)
-        .addFields({ name: "Typ", value: subscriber ? "Abo" : "Trial", inline: true })
+        .setTitle(wasPaid ? "Abo abgelaufen" : "Trial beendet")
+        .setDescription(`<@${entry.userId}> - Jellyfin-Account \`${entry.jellyfinUsername}\` ist nicht mehr aktiv.`)
+        .addFields({ name: "Typ", value: wasPaid ? "Abo (Mitglied bleibt)" : "Trial", inline: true })
         .setColor(0xe67e22)
         .setTimestamp());
       await trialStore.remove(guildId, entry.userId); // erlaubt wieder ein /trial
       continue;
     }
 
-    // Account exists: classify by live jfa-go expiry (Unix seconds; 0 = no expiry).
-    const expiryMs = jfaUser.expiry > 0 ? jfaUser.expiry * 1000 : Number.POSITIVE_INFINITY;
+    // Account active: classify by live jfa-go expiry. Anything well beyond a
+    // trial length has been topped up (paid) and is upgraded.
     const type = expiryMs - now > EXTENDED_THRESHOLD_MS ? "extended" : "trial";
     if (entry.type !== type) await trialStore.set(guildId, { ...entry, type });
-    if (type === "extended" && entry.roleId) {
-      const member = await guild.members.fetch(entry.userId).catch(() => null);
-      if (member?.roles.cache.has(entry.roleId)) {
-        await member.roles.remove(entry.roleId, "Account hochgestuft").catch(() => undefined);
-      }
+    if (type === "extended" && member) {
+      await applyUpgradeRoles(guild, member, entry.roleId);
     }
   }
 }
