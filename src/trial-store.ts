@@ -11,6 +11,7 @@ export type TrialEntry = {
   roleRemoved?: boolean;
   type?: "trial" | "extended"; // classified from the live jfa-go expiry during sync
   expiryWarnedFor?: number; // jfa-go expiry (unix seconds) we already sent a 3-day notice for
+  suspended?: boolean; // paid account deactivated in jfa-go, kept during the grace period
 };
 
 type TrialState = {

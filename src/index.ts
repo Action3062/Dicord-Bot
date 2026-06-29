@@ -2554,28 +2554,26 @@ async function syncAccounts() {
     const jfaUser = byName.get(entry.jellyfinUsername.toLowerCase());
     const member = await guild.members.fetch(entry.userId).catch(() => null);
 
-    // The account counts as ended when jfa-go deleted it, disabled it, or its
-    // expiry is in the past (jfa-go deletes trials at user-expiry).
     const expiryMs = jfaUser && jfaUser.expiry > 0 ? jfaUser.expiry * 1000 : Number.POSITIVE_INFINITY;
-    const ended = !jfaUser || jfaUser.disabled || expiryMs <= now;
+    // "Paid once" if the bot ever classified the account as extended, or the
+    // member still carries a subscription role.
+    const wasPaid = entry.type === "extended" || (member ? memberHasSubscription(member) : false);
 
-    if (ended) {
-      // "Paid once" if the bot ever classified the account as extended, or the
-      // member still carries a subscription role.
-      const wasPaid = entry.type === "extended" || (member ? memberHasSubscription(member) : false);
+    // 1) Account fully deleted from jfa-go (after the ~14-day grace) -> stop tracking.
+    if (!jfaUser) {
       if (member) {
         if (wasPaid) {
-          // Subscription ended: drop Abo/Premium, but keep Mitglied (paid once).
-          await removeSubscriptionRoles(guild, member);
-          await member.send("Dein Jellyfin-Abo ist abgelaufen. Deine Mitglied-Rolle bleibt erhalten - melde dich beim Team, wenn du verlängern möchtest.").catch(() => undefined);
+          await removeSubscriptionRoles(guild, member); // keep Mitglied
+          if (!entry.suspended) {
+            await member.send("Dein Jellyfin-Abo ist abgelaufen. Deine Mitglied-Rolle bleibt erhalten - melde dich beim Team, wenn du verlängern möchtest.").catch(() => undefined);
+          }
         } else if (entry.roleId && member.roles.cache.has(entry.roleId)) {
-          // Pure trial that ended: remove the Trial role.
           await member.roles.remove(entry.roleId, "Trial beendet").catch(() => undefined);
         }
       }
       await logTrial(guild, new EmbedBuilder()
-        .setTitle(wasPaid ? "Abo abgelaufen" : "Trial beendet")
-        .setDescription(`<@${entry.userId}> - Jellyfin-Account \`${entry.jellyfinUsername}\` ist nicht mehr aktiv.`)
+        .setTitle(wasPaid ? "Account gelöscht (Abo)" : "Trial beendet")
+        .setDescription(`<@${entry.userId}> - Jellyfin-Account \`${entry.jellyfinUsername}\` wurde gelöscht.`)
         .addFields({ name: "Typ", value: wasPaid ? "Abo (Mitglied bleibt)" : "Trial", inline: true })
         .setColor(0xe67e22)
         .setTimestamp());
@@ -2583,13 +2581,53 @@ async function syncAccounts() {
       continue;
     }
 
-    // Account active: classify by live jfa-go expiry. Anything well beyond a
-    // trial length has been topped up (paid). "extended" is sticky so a paid
-    // account is never mistaken for a trial during its final hours.
+    // 2) Account deactivated/expired but still in jfa-go (the grace window).
+    const active = !jfaUser.disabled && expiryMs > now;
+    if (!active) {
+      if (wasPaid) {
+        // Keep tracking during the grace period so a reactivation can restore
+        // the Abo role. Notify + strip Abo only once (no hourly spam).
+        if (!entry.suspended) {
+          if (member) {
+            await removeSubscriptionRoles(guild, member); // keep Mitglied
+            await member.send("Dein Jellyfin-Abo ist abgelaufen und dein Zugang wurde deaktiviert. Deine Mitglied-Rolle bleibt erhalten. 💡 Verlängerst du innerhalb der naechsten 14 Tage, wird dein Account reaktiviert und du bekommst die Abo-Rolle automatisch zurück - sonst wird er danach endgültig gelöscht. Zum Verlängern einfach beim Team melden oder ein Ticket öffnen.").catch(() => undefined);
+          }
+          await logTrial(guild, new EmbedBuilder()
+            .setTitle("Abo deaktiviert (Grace-Period)")
+            .setDescription(`<@${entry.userId}> - Account \`${entry.jellyfinUsername}\` ist deaktiviert. Abo-Rolle entfernt, Mitglied bleibt.`)
+            .setColor(0xe67e22)
+            .setTimestamp());
+          await trialStore.set(guildId, { ...entry, suspended: true });
+        }
+      } else if (member && entry.roleId && member.roles.cache.has(entry.roleId)) {
+        // Pure trial that ended: remove the Trial role and free a new /trial.
+        await member.roles.remove(entry.roleId, "Trial beendet").catch(() => undefined);
+        await trialStore.remove(guildId, entry.userId);
+      } else {
+        await trialStore.remove(guildId, entry.userId);
+      }
+      continue;
+    }
+
+    // 3) Account active: classify by live jfa-go expiry. "extended" is sticky so
+    // a paid account is never mistaken for a trial during its final hours.
     const type: "trial" | "extended" = entry.type === "extended" || expiryMs - now > EXTENDED_THRESHOLD_MS ? "extended" : "trial";
     let updated: TrialEntry = entry.type === type ? entry : { ...entry, type };
     if (type === "extended" && member) {
       await applyUpgradeRoles(guild, member, entry.roleId);
+    }
+
+    // Reactivated after a deactivation -> clear suspended and welcome the user back.
+    if (entry.suspended) {
+      updated = { ...updated, suspended: false };
+      if (member && type === "extended") {
+        await member.send("Willkommen zurück! 🎬 Dein Jellyfin-Abo ist wieder aktiv und du hast deine Abo-Rolle zurück.").catch(() => undefined);
+      }
+      await logTrial(guild, new EmbedBuilder()
+        .setTitle("Account reaktiviert")
+        .setDescription(`<@${entry.userId}> - Account \`${entry.jellyfinUsername}\` ist wieder aktiv. Abo-Rolle zurückgegeben.`)
+        .setColor(0x2ecc71)
+        .setTimestamp());
     }
 
     // Three-day heads-up before a paid account expires (once per expiry value).
