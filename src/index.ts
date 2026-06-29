@@ -421,12 +421,80 @@ function aboInfoComponents(guild: Guild) {
   if (config.AZTECO_VOUCHER_URL) {
     row.addComponents(new ButtonBuilder().setLabel("🎁 Azteco-Voucher").setStyle(ButtonStyle.Link).setURL(config.AZTECO_VOUCHER_URL));
   }
-  if (config.DISCORD_TICKET_ENTRY_CHANNEL_ID) {
-    row.addComponents(new ButtonBuilder()
-      .setLabel("📩 Support-Ticket")
-      .setStyle(ButtonStyle.Link)
-      .setURL(`https://discord.com/channels/${guild.id}/${config.DISCORD_TICKET_ENTRY_CHANNEL_ID}`));
+  const ticket = ticketLinkButton(guild);
+  if (ticket) row.addComponents(ticket);
+  return row.components.length ? [row] : [];
+}
+
+function ticketLinkButton(guild: Guild) {
+  if (!config.DISCORD_TICKET_ENTRY_CHANNEL_ID) return null;
+  return new ButtonBuilder()
+    .setLabel("📩 Support-Ticket")
+    .setStyle(ButtonStyle.Link)
+    .setURL(`https://discord.com/channels/${guild.id}/${config.DISCORD_TICKET_ENTRY_CHANNEL_ID}`);
+}
+
+function loginLinkButton() {
+  const url = (config.JELLYFIN_PUBLIC_URL || config.JELLYFIN_BASE_URL).replace(/\/+$/, "");
+  if (!url) return null;
+  return new ButtonBuilder().setLabel("▶️ Jellyfin öffnen").setStyle(ButtonStyle.Link).setURL(url);
+}
+
+// 💎 Abo-Info: what the subscription includes plus a few house rules.
+function aboFeaturesEmbed() {
+  return new EmbedBuilder()
+    .setTitle("💎 Byteflix Abo — Was du bekommst")
+    .setColor(0x5865f2)
+    .setDescription([
+      "✅ Voller Zugriff auf die komplette Byteflix-Mediathek (Filme & Serien)",
+      "⚡ Neue Filme & Serien vollautomatisch zum Release",
+      "📺 2 gleichzeitige Streams pro Mitglied",
+      "🍿 Unbegrenzte Wünsche / Requests",
+      "🎬 Beste verfügbare Qualität",
+      "🧪 Erst gratis testen mit `/trial`"
+    ].join("\n"))
+    .addFields({
+      name: "Gut zu wissen",
+      value: [
+        "• **Mitglied-Rolle bleibt dauerhaft** — einmal bezahlt, bleibt sie dir erhalten.",
+        "• Läuft dein Abo aus, wird der Zugang deaktiviert; bei Verlängerung bekommst du ihn automatisch zurück.",
+        "• Zugangsdaten sind **persönlich** — bitte nicht weitergeben."
+      ].join("\n")
+    })
+    .setFooter({ text: "Byteflix" });
+}
+
+// 🔐 Abo-Zugang: step-by-step from trial to login.
+function aboZugangEmbed() {
+  const login = (config.JELLYFIN_PUBLIC_URL || config.JELLYFIN_BASE_URL).replace(/\/+$/, "") || "https://jellyfin.byteflix.org";
+  return new EmbedBuilder()
+    .setTitle("🔐 Byteflix Abo — So bekommst du Zugang")
+    .setColor(0x5865f2)
+    .setDescription([
+      "**1️⃣ Gratis testen**",
+      "Nutze `/trial` für einen kostenlosen Testzugang — die Zugangsdaten kommen per DM.",
+      "",
+      "**2️⃣ Abo holen**",
+      "Wähle dein Paket in **📦-abo-pakete** und bezahle (Krypto, Azteco-Voucher oder Amazon.de-Gutschein).",
+      "",
+      "**3️⃣ Freischalten lassen**",
+      "Öffne ein **Support-Ticket** und gib deinen **Jellyfin-Benutzernamen** an. Gutschein-Codes **nur** hier eingeben, niemals öffentlich.",
+      "",
+      "**4️⃣ Einloggen**",
+      `Login unter ${login} — bitte ändere dein Passwort nach dem ersten Login.`
+    ].join("\n"))
+    .setFooter({ text: "Fragen? Öffne ein Support-Ticket." });
+}
+
+function aboComponents(guild: Guild, typ: string) {
+  if (typ === "pakete") return aboInfoComponents(guild);
+  const row = new ActionRowBuilder<ButtonBuilder>();
+  if (typ === "zugang") {
+    const login = loginLinkButton();
+    if (login) row.addComponents(login);
   }
+  const ticket = ticketLinkButton(guild);
+  if (ticket) row.addComponents(ticket);
   return row.components.length ? [row] : [];
 }
 
@@ -3343,14 +3411,16 @@ async function handleInteractionCreate(interaction: Interaction) {
 
   if (interaction.commandName === "aboinfo") {
     if (!(await ensureCommandPermission(interaction, (member) => memberHasGuildPermission(member, PermissionFlagsBits.ManageGuild)))) return;
+    const typ = interaction.options.getString("typ", true);
     const channelOption = interaction.options.getChannel("kanal", false);
     const target = await interaction.guild.channels.fetch(channelOption?.id ?? interaction.channelId).catch(() => null);
     if (!canSend(target)) {
       await interaction.reply({ ephemeral: true, content: "Der Zielkanal muss ein Textkanal sein, in dem ich schreiben darf." });
       return;
     }
-    await target.send({ embeds: [aboInfoEmbed()], components: aboInfoComponents(interaction.guild) });
-    await interaction.reply({ ephemeral: true, content: `Abo-Info in <#${target.id}> gepostet.` });
+    const embed = typ === "info" ? aboFeaturesEmbed() : typ === "zugang" ? aboZugangEmbed() : aboInfoEmbed();
+    await target.send({ embeds: [embed], components: aboComponents(interaction.guild, typ) });
+    await interaction.reply({ ephemeral: true, content: `Abo-Beitrag (${typ}) in <#${target.id}> gepostet.` });
     return;
   }
 

@@ -230,8 +230,17 @@ export const commandBuilders = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
     .setName("aboinfo")
-    .setDescription("Postet die Abo-Info (Preise & Zahlung) in einen Kanal.")
+    .setDescription("Postet einen Abo-Channel-Beitrag (Pakete / Info / Zugang).")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption((option) => option
+      .setName("typ")
+      .setDescription("Welcher Beitrag?")
+      .addChoices(
+        { name: "Pakete & Preise", value: "pakete" },
+        { name: "Abo-Info", value: "info" },
+        { name: "Abo-Zugang", value: "zugang" }
+      )
+      .setRequired(true))
     .addChannelOption((option) => option
       .setName("kanal")
       .setDescription("Zielkanal (Standard: aktueller Kanal)")
