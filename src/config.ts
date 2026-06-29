@@ -65,7 +65,11 @@ const schema = z.object({
   DISCORD_TRIAL_ROLE_ID: z.string().default(""),
   DISCORD_TRIAL_LOG_CHANNEL_ID: z.string().default(""),
   DISCORD_ABO_ROLE_ID: z.string().default(""),
-  DISCORD_PREMIUM_ROLE_ID: z.string().default("")
+  DISCORD_PREMIUM_ROLE_ID: z.string().default(""),
+  IPV64_API_KEY: z.string().default(""),
+  STATUS_CHANNEL_ID: z.string().default(""),
+  STATUS_MONITORS: z.string().default("Gateway Server,Jellyfin"),
+  STATUS_REFRESH_MINUTES: z.preprocess((value) => optionalNumber(value, 30), z.number().int().positive())
 });
 
 export const config = schema.parse(process.env);

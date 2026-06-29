@@ -33,6 +33,7 @@ import { config } from "./config.js";
 import { answerQuestion, listFaqTopics, searchFaqItems } from "./faq.js";
 import { FaqStore } from "./faq-store.js";
 import { checkJellyfinUser, getActiveSessionCount, getJellyfinInfo, getJellyfinLibraryStats, refreshJellyfinLibrary, searchJellyfinMedia, type JellyfinLibraryStats } from "./jellyfin.js";
+import { getHealthchecks, isIpv64Configured } from "./ipv64.js";
 import {
   analyzeTicketInput,
   generateAssistantReply,
@@ -427,6 +428,62 @@ function aboInfoComponents(guild: Guild) {
       .setURL(`https://discord.com/channels/${guild.id}/${config.DISCORD_TICKET_ENTRY_CHANNEL_ID}`));
   }
   return row.components.length ? [row] : [];
+}
+
+function statusBoardEmbed(checks: Array<{ name: string; status: "up" | "down" | "unknown" }>) {
+  const emoji = (s: string) => (s === "up" ? "🟢" : s === "down" ? "🔴" : "🟡");
+  const label = (s: string) => (s === "up" ? "Online" : s === "down" ? "Offline" : "Unbekannt");
+  const allUp = checks.length > 0 && checks.every((c) => c.status === "up");
+  const anyDown = checks.some((c) => c.status === "down");
+  const header = checks.length === 0
+    ? "Keine Dienste konfiguriert"
+    : allUp
+      ? "🟢 Alle Systeme online"
+      : anyDown
+        ? "🔴 Störung erkannt"
+        : "🟡 Eingeschränkt";
+  return new EmbedBuilder()
+    .setTitle("Byteflix Status")
+    .setColor(allUp ? 0x2ecc71 : anyDown ? 0xe74c3c : 0xf1c40f)
+    .setDescription([header, "", ...checks.map((c) => `${emoji(c.status)} **${c.name}** — ${label(c.status)}`)].join("\n"))
+    .setFooter({ text: "Zuletzt aktualisiert" })
+    .setTimestamp();
+}
+
+// Pulls the ipv64 healthchecks, keeps only the allowlisted monitor names, and
+// edits a single status message in STATUS_CHANNEL_ID (re-posting if it is gone).
+async function updateStatusBoard() {
+  if (!isIpv64Configured() || !config.STATUS_CHANNEL_ID) return;
+  let checks;
+  try {
+    checks = await getHealthchecks();
+  } catch (error) {
+    console.error("[status] ipv64 Abfrage fehlgeschlagen", error);
+    return;
+  }
+  const wanted = config.STATUS_MONITORS.split(",").map((name) => name.trim().toLowerCase()).filter(Boolean);
+  const selected = wanted.length
+    ? wanted
+        .map((name) => checks.find((check) => check.name.toLowerCase() === name))
+        .filter((check): check is NonNullable<typeof check> => Boolean(check))
+    : checks;
+
+  const channel = await client.channels.fetch(config.STATUS_CHANNEL_ID).catch(() => null);
+  if (!canSend(channel)) return;
+  const textChannel = channel as TextChannel;
+  const guildId = textChannel.guild?.id ?? "";
+  const embed = statusBoardEmbed(selected);
+
+  const existingId = guildId ? await setupStore.getId(guildId, "status:message") : undefined;
+  if (existingId) {
+    const existing = await textChannel.messages.fetch(existingId).catch(() => null);
+    if (existing) {
+      await existing.edit({ embeds: [embed] }).catch(() => undefined);
+      return;
+    }
+  }
+  const sent = await textChannel.send({ embeds: [embed] }).catch(() => null);
+  if (sent && guildId) await setupStore.setId(guildId, "status:message", sent.id);
 }
 
 function ticketEntryEmbed() {
@@ -2860,6 +2917,10 @@ client.once(Events.ClientReady, async () => {
     void syncAccounts().catch((error) => console.error("[accounts] sync failed", error));
   }, 60 * 60_000);
   void syncAccounts();
+  setInterval(() => {
+    void updateStatusBoard().catch((error) => console.error("[status] update failed", error));
+  }, Math.max(10, config.STATUS_REFRESH_MINUTES) * 60_000);
+  void updateStatusBoard();
   console.log(`Discord bot online as ${client.user?.tag}.`);
 });
 
