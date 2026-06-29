@@ -229,6 +229,15 @@ export const commandBuilders = [
     .setDescription("Erstellt Standard-Kanäle und Rollen für den Jellyfin-Discord.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
+    .setName("aboinfo")
+    .setDescription("Postet die Abo-Info (Preise & Zahlung) in einen Kanal.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addChannelOption((option) => option
+      .setName("kanal")
+      .setDescription("Zielkanal (Standard: aktueller Kanal)")
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      .setRequired(false)),
+  new SlashCommandBuilder()
     .setName("serveraufbau")
     .setDescription("Baut die komplette Byteflix-Serverstruktur (Rollen, Kanäle, Rechte) auf.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)

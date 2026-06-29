@@ -383,6 +383,52 @@ function paymentUrl() {
   return `${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/pay`;
 }
 
+// Public pricing/info post for /aboinfo. Content is intentionally inline so it is
+// easy to edit; payment links come from config so nothing sensitive is hardcoded.
+function aboInfoEmbed() {
+  return new EmbedBuilder()
+    .setTitle("🎬 Byteflix Media Server — Jellyfin")
+    .setColor(0x5865f2)
+    .setDescription([
+      "🇩🇪 🇦🇹 🇨🇭",
+      "",
+      "**Das bekommst du**",
+      "✅ Voller Zugriff auf die komplette Byteflix-Mediathek (Filme & Serien)",
+      "⚡ Neue Filme & Serien vollautomatisch zum Release",
+      "📺 2 gleichzeitige Streams pro Mitglied",
+      "🍿 Unbegrenzte Wünsche / Requests",
+      "🧪 Erst gratis testen mit `/trial`"
+    ].join("\n"))
+    .addFields(
+      { name: "Preis", value: "Monatlich: **10 €**\nJährlich: **100 €** (≈ 8,33 €/Monat)" },
+      { name: "So bezahlst du", value: [
+        "₿ **Krypto** — über den **Bezahlen**-Button",
+        "🎁 **Azteco-Voucher** (Kreditkarte/PayPal) — auf azte.co kaufen, dann im Ticket einlösen",
+        "🛒 **Amazon.de-Gutschein** (ab 10 €) — Code **nur per Support-Ticket** einlösen, niemals öffentlich posten"
+      ].join("\n") },
+      { name: "Danach", value: "Gib im Ticket deinen **Jellyfin-Benutzernamen** an → dein Zugang wird freigeschaltet." }
+    )
+    .setFooter({ text: "Byteflix" })
+    .setTimestamp();
+}
+
+function aboInfoComponents(guild: Guild) {
+  const row = new ActionRowBuilder<ButtonBuilder>();
+  if (config.SHOP_PAY_URL) {
+    row.addComponents(new ButtonBuilder().setLabel("💳 Bezahlen").setStyle(ButtonStyle.Link).setURL(config.SHOP_PAY_URL));
+  }
+  if (config.AZTECO_VOUCHER_URL) {
+    row.addComponents(new ButtonBuilder().setLabel("🎁 Azteco-Voucher").setStyle(ButtonStyle.Link).setURL(config.AZTECO_VOUCHER_URL));
+  }
+  if (config.DISCORD_TICKET_ENTRY_CHANNEL_ID) {
+    row.addComponents(new ButtonBuilder()
+      .setLabel("📩 Support-Ticket")
+      .setStyle(ButtonStyle.Link)
+      .setURL(`https://discord.com/channels/${guild.id}/${config.DISCORD_TICKET_ENTRY_CHANNEL_ID}`));
+  }
+  return row.components.length ? [row] : [];
+}
+
 function ticketEntryEmbed() {
   return new EmbedBuilder()
     .setTitle("Support-Tickets")
@@ -3231,6 +3277,19 @@ async function handleInteractionCreate(interaction: Interaction) {
       .addFields({ name: "Dauer", value: `${minutes} Minuten`, inline: true })
       .setColor(0xe74c3c)
       .setTimestamp());
+    return;
+  }
+
+  if (interaction.commandName === "aboinfo") {
+    if (!(await ensureCommandPermission(interaction, (member) => memberHasGuildPermission(member, PermissionFlagsBits.ManageGuild)))) return;
+    const channelOption = interaction.options.getChannel("kanal", false);
+    const target = await interaction.guild.channels.fetch(channelOption?.id ?? interaction.channelId).catch(() => null);
+    if (!canSend(target)) {
+      await interaction.reply({ ephemeral: true, content: "Der Zielkanal muss ein Textkanal sein, in dem ich schreiben darf." });
+      return;
+    }
+    await target.send({ embeds: [aboInfoEmbed()], components: aboInfoComponents(interaction.guild) });
+    await interaction.reply({ ephemeral: true, content: `Abo-Info in <#${target.id}> gepostet.` });
     return;
   }
 
