@@ -10,6 +10,7 @@ export type TrialEntry = {
   roleId?: string;
   roleRemoved?: boolean;
   type?: "trial" | "extended"; // classified from the live jfa-go expiry during sync
+  expiryWarnedFor?: number; // jfa-go expiry (unix seconds) we already sent a 3-day notice for
 };
 
 type TrialState = {

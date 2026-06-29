@@ -2456,6 +2456,8 @@ const MEMBER_ROLE_NAME = "Mitglied";
 // Trials run TRIAL_HOURS (default 26). An account whose live jfa-go expiry is well
 // beyond that has been upgraded (paid) and must not be treated as a trial anymore.
 const EXTENDED_THRESHOLD_MS = 30 * 60 * 60_000;
+// DM a heads-up once the remaining paid runtime drops to this window.
+const EXPIRY_WARNING_MS = 3 * 24 * 60 * 60_000;
 
 async function resolveManagedRole(guild: Guild, configuredId: string, name: string) {
   if (configuredId) {
@@ -2582,12 +2584,35 @@ async function syncAccounts() {
     }
 
     // Account active: classify by live jfa-go expiry. Anything well beyond a
-    // trial length has been topped up (paid) and is upgraded.
-    const type = expiryMs - now > EXTENDED_THRESHOLD_MS ? "extended" : "trial";
-    if (entry.type !== type) await trialStore.set(guildId, { ...entry, type });
+    // trial length has been topped up (paid). "extended" is sticky so a paid
+    // account is never mistaken for a trial during its final hours.
+    const type: "trial" | "extended" = entry.type === "extended" || expiryMs - now > EXTENDED_THRESHOLD_MS ? "extended" : "trial";
+    let updated: TrialEntry = entry.type === type ? entry : { ...entry, type };
     if (type === "extended" && member) {
       await applyUpgradeRoles(guild, member, entry.roleId);
     }
+
+    // Three-day heads-up before a paid account expires (once per expiry value).
+    const remainingMs = expiryMs - now;
+    if (type === "extended" && member && Number.isFinite(expiryMs)
+      && remainingMs > 0 && remainingMs <= EXPIRY_WARNING_MS
+      && entry.expiryWarnedFor !== jfaUser.expiry) {
+      await member.send([
+        "Hallo! 👋",
+        `Dein Jellyfin-Zugang bei Byteflix läuft bald ab - er ist noch bis <t:${jfaUser.expiry}:F> gültig (<t:${jfaUser.expiry}:R>).`,
+        "Danach wird der Account zunächst deaktiviert und später automatisch gelöscht.",
+        "Wenn du weiter dabei sein möchtest, verlängere bitte rechtzeitig - öffne dazu einfach ein Ticket oder melde dich beim Team.",
+        "Deine Mitglied-Rolle bleibt in jedem Fall erhalten. 🎬"
+      ].join("\n")).catch(() => undefined);
+      updated = { ...updated, expiryWarnedFor: jfaUser.expiry };
+      await logTrial(guild, new EmbedBuilder()
+        .setTitle("Ablauf-Erinnerung gesendet")
+        .setDescription(`<@${entry.userId}> - Account \`${entry.jellyfinUsername}\` läuft <t:${jfaUser.expiry}:R> ab.`)
+        .setColor(0xf1c40f)
+        .setTimestamp());
+    }
+
+    if (updated !== entry) await trialStore.set(guildId, updated);
   }
 }
 
