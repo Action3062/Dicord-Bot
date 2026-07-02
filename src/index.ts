@@ -544,6 +544,21 @@ async function updateStatusBoard() {
   const guildId = textChannel.guild?.id ?? "";
   const embed = statusBoardEmbed(selected);
 
+  // Alert on status transitions (up->down and recovery). The first observation
+  // after a restart only sets the baseline so reboots never fire stale alerts.
+  const transitions: Array<{ name: string; to: "up" | "down" }> = [];
+  for (const check of selected) {
+    const key = `${guildId}:${check.name.toLowerCase()}`;
+    const prev = lastMonitorStatus.get(key);
+    lastMonitorStatus.set(key, check.status);
+    if (!prev || prev === check.status) continue;
+    if (check.status === "down") transitions.push({ name: check.name, to: "down" });
+    else if (prev === "down" && check.status === "up") transitions.push({ name: check.name, to: "up" });
+  }
+  if (transitions.length && textChannel.guild) {
+    await postStatusAlerts(textChannel.guild, transitions).catch(() => undefined);
+  }
+
   const existingId = guildId ? await setupStore.getId(guildId, "status:message") : undefined;
   if (existingId) {
     const existing = await textChannel.messages.fetch(existingId).catch(() => null);
@@ -554,6 +569,47 @@ async function updateStatusBoard() {
   }
   const sent = await textChannel.send({ embeds: [embed] }).catch(() => null);
   if (sent && guildId) await setupStore.setId(guildId, "status:message", sent.id);
+}
+
+// In-memory last status per monitor (guildId:name -> up/down/unknown).
+const lastMonitorStatus = new Map<string, string>();
+
+async function postStatusAlerts(guild: Guild, transitions: Array<{ name: string; to: "up" | "down" }>) {
+  const storedId = await setupStore.getId(guild.id, "byteflix:channel:stoerungen");
+  if (!storedId) return;
+  const channel = await guild.channels.fetch(storedId).catch(() => null);
+  if (!canSend(channel)) return;
+  const supportRole = await findManagedRole(guild, config.DISCORD_SUPPORT_ROLE_ID, "Support", "byteflix:role:support");
+  for (const transition of transitions) {
+    const down = transition.to === "down";
+    const embed = new EmbedBuilder()
+      .setTitle(down ? "🔴 Störung" : "🟢 Entwarnung")
+      .setColor(down ? 0xe74c3c : 0x2ecc71)
+      .setDescription(down
+        ? `**${transition.name}** ist aktuell nicht erreichbar. Wir sind dran! 🔧`
+        : `**${transition.name}** ist wieder online. Danke für eure Geduld! 🎬`)
+      .setTimestamp();
+    await channel.send({
+      content: down && supportRole ? `<@&${supportRole.id}>` : undefined,
+      embeds: [embed]
+    }).catch(() => undefined);
+  }
+}
+
+// Short public greeting for new members pointing at rules, /trial and tickets.
+async function sendWelcomeGreeting(member: GuildMember) {
+  const storedId = await setupStore.getId(member.guild.id, "byteflix:channel:willkommen");
+  if (!storedId) return;
+  const channel = await member.guild.channels.fetch(storedId).catch(() => null);
+  if (!canSend(channel)) return;
+  const regelnId = await setupStore.getId(member.guild.id, "byteflix:channel:regeln");
+  const lines = [
+    `Willkommen bei **Byteflix**, ${member}! 🎬`,
+    regelnId ? `📜 Wirf zuerst einen Blick in <#${regelnId}>.` : undefined,
+    "🧪 Teste Byteflix gratis mit `/trial` - deine Zugangsdaten kommen per DM.",
+    config.DISCORD_TICKET_ENTRY_CHANNEL_ID ? `❓ Fragen? Öffne ein Ticket in <#${config.DISCORD_TICKET_ENTRY_CHANNEL_ID}>.` : undefined
+  ].filter((line): line is string => Boolean(line));
+  await channel.send({ content: lines.join("\n") }).catch(() => undefined);
 }
 
 function ticketEntryEmbed() {
@@ -2547,8 +2603,29 @@ async function handleTrialCommand(interaction: ChatInputCommandInteraction) {
 
 async function expireTrials() {
   const now = Date.now();
+  const nudgeWindowMs = config.TRIAL_NUDGE_HOURS * 60 * 60_000;
   for (const { guildId, entry } of await trialStore.activeEntries()) {
-    if (entry.expiresAt > now) continue;
+    if (entry.expiresAt > now) {
+      // Conversion nudge shortly before the trial ends (once per trial): the
+      // moment a tester decides whether to subscribe.
+      if (config.TRIAL_NUDGE_HOURS > 0 && entry.type !== "extended" && !entry.nudgeSent
+        && entry.expiresAt - now <= nudgeWindowMs) {
+        const guild = client.guilds.cache.get(guildId);
+        if (guild) {
+          const member = await guild.members.fetch(entry.userId).catch(() => null);
+          await member?.send({
+            content: [
+              `Dein Byteflix-Testzugang läuft <t:${Math.floor(entry.expiresAt / 1000)}:R> ab. ⏳`,
+              "Gefällt dir Byteflix? Mit dem Abo (**10 €/Monat** oder **100 €/Jahr**) streamst du einfach weiter - dein Account bleibt bestehen und wird nach der Zahlung automatisch verlängert.",
+              "Alle Infos & Zahlungswege:"
+            ].join("\n"),
+            components: aboInfoComponents(guild)
+          }).catch(() => undefined);
+          await trialStore.set(guildId, { ...entry, nudgeSent: true });
+        }
+      }
+      continue;
+    }
     const guild = client.guilds.cache.get(guildId);
     if (guild && entry.roleId) {
       const roleId = entry.roleId;
@@ -2777,13 +2854,16 @@ async function syncAccounts() {
     if (type === "extended" && member && Number.isFinite(expiryMs)
       && remainingMs > 0 && remainingMs <= EXPIRY_WARNING_MS
       && entry.expiryWarnedFor !== jfaUser.expiry) {
-      await member.send([
-        "Hallo! 👋",
-        `Dein Jellyfin-Zugang bei Byteflix läuft bald ab - er ist noch bis <t:${jfaUser.expiry}:F> gültig (<t:${jfaUser.expiry}:R>).`,
-        "Danach wird der Account zunächst deaktiviert und später automatisch gelöscht.",
-        "Wenn du weiter dabei sein möchtest, verlängere bitte rechtzeitig - öffne dazu einfach ein Ticket oder melde dich beim Team.",
-        "Deine Mitglied-Rolle bleibt in jedem Fall erhalten. 🎬"
-      ].join("\n")).catch(() => undefined);
+      await member.send({
+        content: [
+          "Hallo! 👋",
+          `Dein Jellyfin-Zugang bei Byteflix läuft bald ab - er ist noch bis <t:${jfaUser.expiry}:F> gültig (<t:${jfaUser.expiry}:R>).`,
+          "Danach wird der Account zunächst deaktiviert und später automatisch gelöscht.",
+          "Wenn du weiter dabei sein möchtest, verlängere bitte rechtzeitig - hier sind alle Zahlungswege:",
+          "Deine Mitglied-Rolle bleibt in jedem Fall erhalten. 🎬"
+        ].join("\n"),
+        components: aboInfoComponents(guild)
+      }).catch(() => undefined);
       updated = { ...updated, expiryWarnedFor: jfaUser.expiry };
       await logTrial(guild, new EmbedBuilder()
         .setTitle("Ablauf-Erinnerung gesendet")
@@ -2945,6 +3025,9 @@ client.once(Events.ClientReady, async () => {
 });
 
 client.on(Events.GuildMemberAdd, async (member) => {
+  if (config.ENABLE_WELCOME) {
+    await sendWelcomeGreeting(member).catch(() => undefined);
+  }
   if (!config.ENABLE_MEMBER_MONITORING && !config.ENABLE_NEW_ACCOUNT_PROTECTION) return;
   await store.recordJoin(member.id);
 
@@ -3363,6 +3446,60 @@ async function handleInteractionCreate(interaction: Interaction) {
     const embed = typ === "info" ? aboFeaturesEmbed() : typ === "zugang" ? aboZugangEmbed() : aboInfoEmbed();
     await target.send({ embeds: [embed], components: aboComponents(interaction.guild, typ) });
     await interaction.reply({ ephemeral: true, content: `Abo-Beitrag (${typ}) in <#${target.id}> gepostet.` });
+    return;
+  }
+
+  if (interaction.commandName === "suche") {
+    const query = interaction.options.getString("titel", true).trim();
+    await interaction.deferReply({ ephemeral: true });
+    const result = await searchJellyfinMedia(query).catch(() => null);
+    if (!result || !result.configured) {
+      await interaction.editReply("Die Mediathek-Suche ist gerade nicht verfügbar.");
+      return;
+    }
+    if (!result.items.length) {
+      await interaction.editReply(`Zu "${query}" wurde in der Mediathek nichts gefunden. Mit \`/wunsch ${query}\` kannst du es dir wünschen!`);
+      return;
+    }
+    const lines = result.items.map((item) => {
+      const year = item.ProductionYear ? ` (${item.ProductionYear})` : "";
+      const type = item.Type === "Series" ? "📺 Serie" : "🎬 Film";
+      return `${type} — **${item.Name ?? "Unbenannt"}**${year}`;
+    });
+    await interaction.editReply([`Treffer für "${query}" (${result.total} gesamt):`, ...lines].join("\n"));
+    return;
+  }
+
+  if (interaction.commandName === "wartung") {
+    if (!(await ensureCommandPermission(interaction, isModerator))) return;
+    const startInMin = interaction.options.getInteger("start_in_minuten", true);
+    const dauer = interaction.options.getInteger("dauer_minuten", true);
+    const grund = interaction.options.getString("grund", false)?.trim();
+    const channelOption = interaction.options.getChannel("kanal", false);
+    let target = channelOption ? await interaction.guild.channels.fetch(channelOption.id).catch(() => null) : null;
+    if (!target) {
+      const storedId = await setupStore.getId(interaction.guild.id, "byteflix:channel:wartungen");
+      if (storedId) target = await interaction.guild.channels.fetch(storedId).catch(() => null);
+    }
+    if (!canSend(target)) {
+      await interaction.reply({ ephemeral: true, content: "Kein Wartungs-Channel gefunden - bitte gib einen Zielkanal an." });
+      return;
+    }
+    const start = Math.floor((Date.now() + startInMin * 60_000) / 1000);
+    const end = start + dauer * 60;
+    const embed = new EmbedBuilder()
+      .setTitle("📡 Geplante Wartung")
+      .setColor(0xf1c40f)
+      .setDescription([
+        `**Beginn:** <t:${start}:F> (<t:${start}:R>)`,
+        `**Voraussichtliche Dauer:** ${dauer} Minuten (bis ca. <t:${end}:t>)`,
+        grund ? `**Was wird gemacht:** ${grund}` : undefined,
+        "",
+        "Während der Wartung kann es zu Unterbrechungen beim Streaming kommen. Danke für eure Geduld! 🙏"
+      ].filter((line): line is string => line !== undefined).join("\n"))
+      .setTimestamp();
+    await target.send({ embeds: [embed] });
+    await interaction.reply({ ephemeral: true, content: `Wartungsankündigung in <#${target.id}> gepostet.` });
     return;
   }
 

@@ -12,6 +12,7 @@ export type TrialEntry = {
   type?: "trial" | "extended"; // classified from the live jfa-go expiry during sync
   expiryWarnedFor?: number; // jfa-go expiry (unix seconds) we already sent a 3-day notice for
   suspended?: boolean; // paid account deactivated in jfa-go, kept during the grace period
+  nudgeSent?: boolean; // conversion nudge DM sent shortly before trial expiry
 };
 
 type TrialState = {

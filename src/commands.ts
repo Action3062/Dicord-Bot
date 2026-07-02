@@ -140,6 +140,48 @@ export const commandBuilders = [
     .setName("trial")
     .setDescription("Erstellt dir einen zeitlich begrenzten Jellyfin-Testzugang."),
   new SlashCommandBuilder()
+    .setName("suche")
+    .setDescription("Sucht einen Film oder eine Serie in der Byteflix-Mediathek.")
+    .addStringOption((option) => option
+      .setName("titel")
+      .setDescription("Titel des Films / der Serie")
+      .setMaxLength(120)
+      .setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("wunsch")
+    .setDescription("Wünsche dir einen Film oder eine Serie für Byteflix.")
+    .addStringOption((option) => option
+      .setName("titel")
+      .setDescription("Titel des Films / der Serie")
+      .setMaxLength(120)
+      .setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("wartung")
+    .setDescription("Kündigt eine Wartung an (Team).")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .addIntegerOption((option) => option
+      .setName("start_in_minuten")
+      .setDescription("Beginn in X Minuten (0 = sofort)")
+      .setMinValue(0)
+      .setMaxValue(10080)
+      .setRequired(true))
+    .addIntegerOption((option) => option
+      .setName("dauer_minuten")
+      .setDescription("Geplante Dauer in Minuten")
+      .setMinValue(5)
+      .setMaxValue(1440)
+      .setRequired(true))
+    .addStringOption((option) => option
+      .setName("grund")
+      .setDescription("Was wird gemacht?")
+      .setMaxLength(300)
+      .setRequired(false))
+    .addChannelOption((option) => option
+      .setName("kanal")
+      .setDescription("Zielkanal (Standard: Wartungs-Channel)")
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+      .setRequired(false)),
+  new SlashCommandBuilder()
     .setName("meinaccount")
     .setDescription("Zeigt deinen verknüpften Jellyfin-Account und Status."),
   new SlashCommandBuilder()
