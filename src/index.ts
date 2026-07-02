@@ -32,8 +32,10 @@ import { commands } from "./commands.js";
 import { config } from "./config.js";
 import { answerQuestion, listFaqTopics, searchFaqItems } from "./faq.js";
 import { FaqStore } from "./faq-store.js";
-import { checkJellyfinUser, getActiveSessionCount, getJellyfinInfo, getJellyfinLibraryStats, refreshJellyfinLibrary, searchJellyfinMedia, type JellyfinLibraryStats } from "./jellyfin.js";
+import { checkJellyfinUser, getActiveSessionCount, getJellyfinInfo, getJellyfinLibraryStats, getRecentlyAddedMedia, refreshJellyfinLibrary, searchJellyfinMedia, type JellyfinLibraryStats } from "./jellyfin.js";
 import { getHealthchecks, isIpv64Configured } from "./ipv64.js";
+import { createJellyseerrRequest, isJellyseerrConfigured, JELLYSEERR_STATUS_AVAILABLE, searchJellyseerr } from "./jellyseerr.js";
+import { FunnelStore } from "./funnel-store.js";
 import {
   analyzeTicketInput,
   generateAssistantReply,
@@ -62,6 +64,7 @@ const supportStore = SupportStore.fromDataDir(config.BOT_DATA_DIR);
 const faqStore = FaqStore.fromDataDir(config.BOT_DATA_DIR);
 const statsStore = StatsStore.fromDataDir(config.BOT_DATA_DIR);
 const trialStore = TrialStore.fromDataDir(config.BOT_DATA_DIR);
+const funnelStore = FunnelStore.fromDataDir(config.BOT_DATA_DIR);
 const setupStore = SetupStore.fromDataDir(config.BOT_DATA_DIR);
 type RecentUserMessage = {
   at: number;
@@ -74,6 +77,7 @@ const recentMessages = new Map<string, RecentUserMessage[]>();
 const moderationCooldowns = new Map<string, number>();
 const TICKET_CREATE_BUTTON_ID = "ticket:create";
 const TICKET_CLOSE_BUTTON_ID = "ticket:close";
+const WUNSCH_BUTTON_PREFIX = "wunsch:";
 const TICKET_CREATE_MODAL_ID = "ticket:create-modal";
 const TICKET_MODAL_SUBJECT_ID = "ticket-subject";
 const TICKET_MODAL_DESCRIPTION_ID = "ticket-description";
@@ -610,6 +614,115 @@ async function sendWelcomeGreeting(member: GuildMember) {
     config.DISCORD_TICKET_ENTRY_CHANNEL_ID ? `❓ Fragen? Öffne ein Ticket in <#${config.DISCORD_TICKET_ENTRY_CHANNEL_ID}>.` : undefined
   ].filter((line): line is string => Boolean(line));
   await channel.send({ content: lines.join("\n") }).catch(() => undefined);
+}
+
+// Posts newly added movies/series into NEW_CONTENT_CHANNEL_ID. Tracks the last
+// seen DateCreated in the setup store; the first run only sets the baseline so
+// the channel is never flooded with the whole library.
+async function updateNewContentFeed() {
+  if (!config.NEW_CONTENT_CHANNEL_ID) return;
+  const channel = await client.channels.fetch(config.NEW_CONTENT_CHANNEL_ID).catch(() => null);
+  if (!canSend(channel)) return;
+  const feedChannel = channel as TextChannel;
+  const guildId = feedChannel.guild?.id;
+  if (!guildId) return;
+
+  let result;
+  try {
+    result = await getRecentlyAddedMedia(25);
+  } catch (error) {
+    console.error("[feed] Jellyfin Abfrage fehlgeschlagen", error);
+    return;
+  }
+  if (!result.configured || !result.items.length) return;
+
+  const newestCreated = result.items
+    .map((item) => item.DateCreated ?? "")
+    .filter(Boolean)
+    .sort()
+    .at(-1);
+  if (!newestCreated) return;
+
+  const lastSeen = await setupStore.getId(guildId, "feed:lastCreated");
+  if (!lastSeen) {
+    await setupStore.setId(guildId, "feed:lastCreated", newestCreated);
+    return;
+  }
+
+  const fresh = result.items
+    .filter((item) => item.DateCreated && item.DateCreated > lastSeen)
+    .sort((a, b) => (a.DateCreated ?? "").localeCompare(b.DateCreated ?? ""))
+    .slice(0, 5); // cap per cycle; the rest follows next cycle
+  if (!fresh.length) return;
+
+  const publicBase = (config.JELLYFIN_PUBLIC_URL || config.JELLYFIN_BASE_URL).replace(/\/+$/, "");
+  const embeds = fresh.map((item) => {
+    const isSeries = item.Type === "Series";
+    const embed = new EmbedBuilder()
+      .setTitle(`${isSeries ? "📺" : "🎬"} ${item.Name ?? "Unbenannt"}${item.ProductionYear ? ` (${item.ProductionYear})` : ""}`)
+      .setDescription(item.Overview ? `${item.Overview.slice(0, 300)}${item.Overview.length > 300 ? "…" : ""}` : null)
+      .setColor(0x5865f2)
+      .setFooter({ text: isSeries ? "Neue Serie auf Byteflix" : "Neuer Film auf Byteflix" })
+      .setTimestamp(item.DateCreated ? new Date(item.DateCreated) : null);
+    if (item.Id && publicBase) {
+      embed.setThumbnail(`${publicBase}/Items/${item.Id}/Images/Primary?maxWidth=300&quality=90`);
+    }
+    return embed;
+  });
+  await feedChannel.send({ embeds }).catch(() => undefined);
+  const postedNewest = fresh.at(-1)?.DateCreated ?? newestCreated;
+  await setupStore.setId(guildId, "feed:lastCreated", postedNewest);
+}
+
+// Monday team report with the abo-funnel counters collected since the last one.
+async function maybePostWeeklyReport() {
+  const now = new Date();
+  if (now.getDay() !== 1) return; // Montag
+  const last = await funnelStore.getLastReportAt();
+  if (last && now.getTime() - new Date(last).getTime() < 6 * 24 * 60 * 60_000) return;
+
+  const entries = await trialStore.allEntries();
+  for (const guild of client.guilds.cache.values()) {
+    const counters = await funnelStore.getCounters(guild.id);
+    const guildEntries = entries.filter((item) => item.guildId === guild.id);
+    const activeAbos = guildEntries.filter((item) => item.entry.type === "extended" && !item.entry.suspended).length;
+    const activeTrials = guildEntries.filter((item) => item.entry.type !== "extended" && !item.entry.roleRemoved).length;
+    const embed = new EmbedBuilder()
+      .setTitle("📊 Byteflix Wochenreport")
+      .setColor(0x5865f2)
+      .addFields(
+        { name: "Neue Trials", value: String(counters.trials), inline: true },
+        { name: "Upgrades zu Abo", value: String(counters.upgrades), inline: true },
+        { name: "Abos abgelaufen", value: String(counters.expired), inline: true },
+        { name: "Reaktivierungen", value: String(counters.reactivated), inline: true },
+        { name: "Aktive Abos", value: String(activeAbos), inline: true },
+        { name: "Aktive Trials", value: String(activeTrials), inline: true }
+      )
+      .setFooter({ text: "Zeitraum: seit dem letzten Report" })
+      .setTimestamp();
+    await logTrial(guild, embed);
+    await funnelStore.resetAfterReport(guild.id, now.toISOString());
+  }
+}
+
+async function handleWunschButton(interaction: ButtonInteraction) {
+  const [, mediaType, idRaw] = interaction.customId.split(":");
+  const tmdbId = Number(idRaw);
+  if ((mediaType !== "movie" && mediaType !== "tv") || !Number.isFinite(tmdbId)) return;
+  await interaction.deferUpdate();
+  try {
+    await createJellyseerrRequest(mediaType, tmdbId);
+    await interaction.editReply({
+      content: "✅ Dein Wunsch wurde eingetragen! Sobald der Titel verfügbar ist, findest du ihn in der Mediathek.",
+      components: []
+    });
+  } catch (error) {
+    console.error("[wunsch] Request fehlgeschlagen", error);
+    await interaction.editReply({
+      content: "❌ Der Wunsch konnte nicht eingetragen werden. Versuch es später erneut oder öffne ein Support-Ticket.",
+      components: []
+    }).catch(() => undefined);
+  }
 }
 
 function ticketEntryEmbed() {
@@ -2584,6 +2697,7 @@ async function handleTrialCommand(interaction: ChatInputCommandInteraction) {
     roleId,
     roleRemoved: false
   });
+  await funnelStore.increment(interaction.guild.id, "trials").catch(() => undefined);
 
   await logTrial(interaction.guild, new EmbedBuilder()
     .setTitle("Neuer Trial-Account")
@@ -2789,6 +2903,7 @@ async function syncAccounts() {
         .addFields({ name: "Typ", value: wasPaid ? "Abo (Mitglied bleibt)" : "Trial", inline: true })
         .setColor(0xe67e22)
         .setTimestamp());
+      if (wasPaid && !entry.suspended) await funnelStore.increment(guildId, "expired").catch(() => undefined);
       await trialStore.remove(guildId, entry.userId); // erlaubt wieder ein /trial
       continue;
     }
@@ -2810,6 +2925,7 @@ async function syncAccounts() {
             .setColor(0xe67e22)
             .setTimestamp());
           await trialStore.set(guildId, { ...entry, suspended: true });
+          await funnelStore.increment(guildId, "expired").catch(() => undefined);
         }
       } else if (member && entry.roleId && member.roles.cache.has(entry.roleId)) {
         // Pure trial that ended: remove the Trial role and free a new /trial.
@@ -2828,6 +2944,7 @@ async function syncAccounts() {
     if (type === "extended" && member) {
       await applyUpgradeRoles(guild, member, entry.roleId);
       if (entry.type !== "extended") {
+        await funnelStore.increment(guildId, "upgrades").catch(() => undefined);
         await logTrial(guild, new EmbedBuilder()
           .setTitle("Account hochgestuft")
           .setDescription(`<@${entry.userId}> - \`${entry.jellyfinUsername}\` ist jetzt Abo. Rollen Mitglied + Abo vergeben.`)
@@ -2839,6 +2956,7 @@ async function syncAccounts() {
     // Reactivated after a deactivation -> clear suspended and welcome the user back.
     if (entry.suspended) {
       updated = { ...updated, suspended: false };
+      await funnelStore.increment(guildId, "reactivated").catch(() => undefined);
       if (member && type === "extended") {
         await member.send("Willkommen zurück! 🎬 Dein Jellyfin-Abo ist wieder aktiv und du hast deine Abo-Rolle zurück.").catch(() => undefined);
       }
@@ -2981,6 +3099,7 @@ client.once(Events.ClientReady, async () => {
   await statsStore.load();
   await trialStore.load();
   await setupStore.load();
+  await funnelStore.load();
   await registerCommands();
   for (const guild of client.guilds.cache.values()) {
     await ensureTicketEntryInstructions(guild).catch(() => undefined);
@@ -3021,6 +3140,14 @@ client.once(Events.ClientReady, async () => {
     void updateStatusBoard().catch((error) => console.error("[status] update failed", error));
   }, Math.max(10, config.STATUS_REFRESH_MINUTES) * 60_000);
   void updateStatusBoard();
+  setInterval(() => {
+    void updateNewContentFeed().catch((error) => console.error("[feed] update failed", error));
+  }, Math.max(10, config.NEW_CONTENT_CHECK_MINUTES) * 60_000);
+  void updateNewContentFeed();
+  setInterval(() => {
+    void maybePostWeeklyReport().catch((error) => console.error("[report] weekly report failed", error));
+  }, 60 * 60_000);
+  void maybePostWeeklyReport();
   console.log(`Discord bot online as ${client.user?.tag}.`);
 });
 
@@ -3175,6 +3302,9 @@ async function handleInteractionCreate(interaction: Interaction) {
     }
     if (interaction.customId === TICKET_CLOSE_BUTTON_ID) {
       await handleTicketCloseButton(interaction);
+    }
+    if (interaction.customId.startsWith(WUNSCH_BUTTON_PREFIX)) {
+      await handleWunschButton(interaction);
     }
     if (interaction.customId === AI_LIBRARY_SCAN_BUTTON_ID) {
       await handleLibraryScanButton(interaction);
@@ -3446,6 +3576,50 @@ async function handleInteractionCreate(interaction: Interaction) {
     const embed = typ === "info" ? aboFeaturesEmbed() : typ === "zugang" ? aboZugangEmbed() : aboInfoEmbed();
     await target.send({ embeds: [embed], components: aboComponents(interaction.guild, typ) });
     await interaction.reply({ ephemeral: true, content: `Abo-Beitrag (${typ}) in <#${target.id}> gepostet.` });
+    return;
+  }
+
+  if (interaction.commandName === "wunsch") {
+    if (!isJellyseerrConfigured()) {
+      await interaction.reply({ ephemeral: true, content: "Das Wunsch-System ist gerade nicht verfügbar." });
+      return;
+    }
+    const member = await getInteractionMember(interaction);
+    if (!member || !memberHasMemberStatus(member)) {
+      await interaction.reply({ ephemeral: true, content: "Wünsche sind für Mitglieder verfügbar - hol dir z. B. mit /trial einen Testzugang." });
+      return;
+    }
+    const query = interaction.options.getString("titel", true).trim();
+    await interaction.deferReply({ ephemeral: true });
+    let results;
+    try {
+      results = await searchJellyseerr(query);
+    } catch (error) {
+      console.error("[wunsch] Suche fehlgeschlagen", error);
+      await interaction.editReply("Die Wunsch-Suche ist gerade nicht erreichbar. Versuch es später erneut.");
+      return;
+    }
+    if (!results.length) {
+      await interaction.editReply(`Zu "${query}" wurde nichts gefunden - prüfe die Schreibweise.`);
+      return;
+    }
+    const row = new ActionRowBuilder<ButtonBuilder>();
+    for (const result of results) {
+      const available = result.status === JELLYSEERR_STATUS_AVAILABLE;
+      const label = `${result.mediaType === "tv" ? "📺" : "🎬"} ${result.title}${result.year ? ` (${result.year})` : ""}`.slice(0, 80);
+      row.addComponents(new ButtonBuilder()
+        .setCustomId(`${WUNSCH_BUTTON_PREFIX}${result.mediaType}:${result.id}`)
+        .setLabel(label)
+        .setStyle(available ? ButtonStyle.Secondary : ButtonStyle.Primary)
+        .setDisabled(available));
+    }
+    await interaction.editReply({
+      content: [
+        `Treffer für "${query}" - wähle aus, was du dir wünschst:`,
+        results.some((result) => result.status === JELLYSEERR_STATUS_AVAILABLE) ? "-# Ausgegraute Titel sind bereits verfügbar." : undefined
+      ].filter((line): line is string => Boolean(line)).join("\n"),
+      components: [row]
+    });
     return;
   }
 

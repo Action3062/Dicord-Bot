@@ -18,6 +18,7 @@ export type JellyfinMediaItem = {
   PremiereDate?: string;
   DateCreated?: string;
   Path?: string;
+  Overview?: string;
 };
 
 type JellyfinItemsResponse = {
@@ -100,6 +101,26 @@ export async function searchJellyfinMedia(query: string) {
     items: result.Items ?? [],
     total: result.TotalRecordCount ?? result.Items?.length ?? 0
   };
+}
+
+// Newest movies/series by DateCreated - source for the Discord new-content feed.
+export async function getRecentlyAddedMedia(limit = 20) {
+  if (!config.JELLYFIN_BASE_URL || !config.JELLYFIN_API_KEY) {
+    return { configured: false as const, items: [] as JellyfinMediaItem[] };
+  }
+  const base = trimTrailingSlash(config.JELLYFIN_BASE_URL);
+  const params = new URLSearchParams({
+    Recursive: "true",
+    IncludeItemTypes: "Movie,Series",
+    SortBy: "DateCreated",
+    SortOrder: "Descending",
+    Fields: "DateCreated,ProductionYear,Overview",
+    Limit: String(limit)
+  });
+  const result = await fetchJson<JellyfinItemsResponse>(`${base}/Items?${params}`, {
+    headers: { "X-Emby-Token": config.JELLYFIN_API_KEY }
+  });
+  return { configured: true as const, items: result.Items ?? [] };
 }
 
 export async function refreshJellyfinLibrary() {
