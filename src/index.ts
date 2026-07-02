@@ -2630,50 +2630,76 @@ const EXTENDED_THRESHOLD_MS = 30 * 60 * 60_000;
 // DM a heads-up once the remaining paid runtime drops to this window.
 const EXPIRY_WARNING_MS = 3 * 24 * 60 * 60_000;
 
-async function resolveManagedRole(guild: Guild, configuredId: string, name: string) {
-  if (configuredId) {
-    const byId = guild.roles.cache.get(configuredId) ?? await guild.roles.fetch(configuredId).catch(() => null);
-    if (byId) return byId;
-  }
-  const byName = guild.roles.cache.find((role) => role.name.toLowerCase() === name.toLowerCase());
-  if (byName) return byName;
+// Resolution order: configured env ID -> role created by /serveraufbau (setup
+// store) -> exact name -> create. The setup-store fallback matters because the
+// serveraufbau roles carry emoji prefixes ("💎 Abonnent", "👤 Mitglied") that an
+// exact name match on "Abo"/"Mitglied" would never hit.
+async function resolveManagedRole(guild: Guild, configuredId: string, name: string, setupKey?: string) {
+  const existing = await findManagedRole(guild, configuredId, name, setupKey);
+  if (existing) return existing;
   return guild.roles.create({ name, reason: "Account-Rollen (Setup)" }).catch(() => null);
 }
 
 async function ensureAccountRoles(guild: Guild) {
-  await resolveManagedRole(guild, config.DISCORD_TRIAL_ROLE_ID, TRIAL_ROLE_NAME);
-  await resolveManagedRole(guild, config.DISCORD_ABO_ROLE_ID, ABO_ROLE_NAME);
+  await resolveManagedRole(guild, config.DISCORD_TRIAL_ROLE_ID, TRIAL_ROLE_NAME, "byteflix:role:trial");
+  await resolveManagedRole(guild, config.DISCORD_ABO_ROLE_ID, ABO_ROLE_NAME, "byteflix:role:abonnent");
   await resolveManagedRole(guild, config.DISCORD_PREMIUM_ROLE_ID, PREMIUM_ROLE_NAME);
 }
 
 function memberHasSubscription(member: GuildMember) {
-  const names = [ABO_ROLE_NAME.toLowerCase(), PREMIUM_ROLE_NAME.toLowerCase()];
   const ids = [config.DISCORD_ABO_ROLE_ID, config.DISCORD_PREMIUM_ROLE_ID].filter(Boolean);
-  return member.roles.cache.some((role) => ids.includes(role.id) || names.includes(role.name.toLowerCase()));
+  // Substring match so "💎 Abonnent" and "Premium Abo" count as subscriptions too.
+  return member.roles.cache.some((role) => ids.includes(role.id) || role.name.toLowerCase().includes("abo"));
 }
 
 // Like resolveManagedRole, but never creates a role - used when we only want to
 // remove an existing role and must not accidentally create it as a side effect.
-async function findManagedRole(guild: Guild, configuredId: string, name: string) {
+async function findManagedRole(guild: Guild, configuredId: string, name: string, setupKey?: string) {
   if (configuredId) {
     const byId = guild.roles.cache.get(configuredId) ?? await guild.roles.fetch(configuredId).catch(() => null);
     if (byId) return byId;
   }
+  if (setupKey) {
+    const storedId = await setupStore.getId(guild.id, setupKey);
+    if (storedId) {
+      const stored = guild.roles.cache.get(storedId) ?? await guild.roles.fetch(storedId).catch(() => null);
+      if (stored) return stored;
+    }
+  }
   return guild.roles.cache.find((role) => role.name.toLowerCase() === name.toLowerCase()) ?? null;
+}
+
+// Adds a role and surfaces failures (e.g. 50013 when the role sits above the
+// bot's highest role) instead of swallowing them - hierarchy problems were
+// invisible before and made upgrades look like they half-worked.
+async function addRoleLogged(member: GuildMember, role: { id: string; name: string }, reason: string) {
+  try {
+    await member.roles.add(role.id, reason);
+    return true;
+  } catch (error) {
+    console.error(`[accounts] Rolle "${role.name}" konnte nicht vergeben werden`, error);
+    await logErrorToDiscord({
+      guild: member.guild,
+      title: "Rollenvergabe fehlgeschlagen",
+      error,
+      context: { user: member.user.tag, userId: member.id, rolle: role.name, grund: reason }
+    });
+    return false;
+  }
 }
 
 // Upgrade a paid/topped-up account: grant Mitglied (kept permanently once paid)
 // and Abo, and drop the Trial role. Idempotent - safe to run every sync.
 async function applyUpgradeRoles(guild: Guild, member: GuildMember, trialRoleId?: string) {
-  const memberRole = await resolveManagedRole(guild, config.DISCORD_MEMBER_ROLE_ID, MEMBER_ROLE_NAME);
+  const memberRole = await resolveManagedRole(guild, config.DISCORD_MEMBER_ROLE_ID, MEMBER_ROLE_NAME, "byteflix:role:mitglied");
   if (memberRole && !member.roles.cache.has(memberRole.id)) {
-    await member.roles.add(memberRole, "Account hochgestuft (bezahlt)").catch(() => undefined);
+    await addRoleLogged(member, memberRole, "Account hochgestuft (bezahlt)");
   }
-  const aboRole = await resolveManagedRole(guild, config.DISCORD_ABO_ROLE_ID, ABO_ROLE_NAME);
+  const aboRole = await resolveManagedRole(guild, config.DISCORD_ABO_ROLE_ID, ABO_ROLE_NAME, "byteflix:role:abonnent");
   if (aboRole && !member.roles.cache.has(aboRole.id)) {
-    await member.roles.add(aboRole, "Abo aktiv").catch(() => undefined);
+    await addRoleLogged(member, aboRole, "Abo aktiv");
   }
-  const trialRole = await findManagedRole(guild, config.DISCORD_TRIAL_ROLE_ID, TRIAL_ROLE_NAME);
+  const trialRole = await findManagedRole(guild, config.DISCORD_TRIAL_ROLE_ID, TRIAL_ROLE_NAME, "byteflix:role:trial");
   for (const roleId of [trialRoleId, trialRole?.id]) {
     if (roleId && member.roles.cache.has(roleId)) {
       await member.roles.remove(roleId, "Account hochgestuft").catch(() => undefined);
@@ -2683,12 +2709,12 @@ async function applyUpgradeRoles(guild: Guild, member: GuildMember, trialRoleId?
 
 // Subscription ended: remove Abo + Premium, but keep Mitglied (already paid once).
 async function removeSubscriptionRoles(guild: Guild, member: GuildMember) {
-  const subscriptionRoles: Array<readonly [string, string]> = [
-    [config.DISCORD_ABO_ROLE_ID, ABO_ROLE_NAME],
-    [config.DISCORD_PREMIUM_ROLE_ID, PREMIUM_ROLE_NAME]
+  const subscriptionRoles: Array<readonly [string, string, string | undefined]> = [
+    [config.DISCORD_ABO_ROLE_ID, ABO_ROLE_NAME, "byteflix:role:abonnent"],
+    [config.DISCORD_PREMIUM_ROLE_ID, PREMIUM_ROLE_NAME, undefined]
   ];
-  for (const [configuredId, name] of subscriptionRoles) {
-    const role = await findManagedRole(guild, configuredId, name);
+  for (const [configuredId, name, setupKey] of subscriptionRoles) {
+    const role = await findManagedRole(guild, configuredId, name, setupKey);
     if (role && member.roles.cache.has(role.id)) {
       await member.roles.remove(role, "Abo abgelaufen").catch(() => undefined);
     }
@@ -2786,6 +2812,13 @@ async function syncAccounts() {
     let updated: TrialEntry = entry.type === type ? entry : { ...entry, type };
     if (type === "extended" && member) {
       await applyUpgradeRoles(guild, member, entry.roleId);
+      if (entry.type !== "extended") {
+        await logTrial(guild, new EmbedBuilder()
+          .setTitle("Account hochgestuft")
+          .setDescription(`<@${entry.userId}> - \`${entry.jellyfinUsername}\` ist jetzt Abo. Rollen Mitglied + Abo vergeben.`)
+          .setColor(0x2ecc71)
+          .setTimestamp());
+      }
     }
 
     // Reactivated after a deactivation -> clear suspended and welcome the user back.
