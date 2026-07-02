@@ -61,6 +61,13 @@ const schema = z.object({
   JFA_GO_ADMIN_PASSWORD: z.string().default(""),
   JFA_GO_PROFILE: z.string().default(""),
   TRIAL_HOURS: z.preprocess((value) => optionalNumber(value, 26), z.number().int().positive()),
+  TRIAL_STATUS_URL: z.string().default(""),
+  // Base URL of the payment portal API for the two-way integration (feature
+  // flags, support status, heartbeat, reports, command queue). Leave empty to
+  // run the bot fully standalone. BOT_API_SECRET must match the portal's.
+  PORTAL_BASE_URL: z.string().default(""),
+  BOT_API_SECRET: z.string().default(""),
+  PORTAL_SYNC_MINUTES: z.preprocess((value) => optionalNumber(value, 5), z.number().int().positive()),
   DISCORD_TRIAL_ROLE_ID: z.string().default(""),
   DISCORD_TRIAL_LOG_CHANNEL_ID: z.string().default(""),
   DISCORD_ABO_ROLE_ID: z.string().default(""),

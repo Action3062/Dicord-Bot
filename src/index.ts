@@ -54,6 +54,9 @@ import { getTicketCategory, inferTicketCategory } from "./ticket-categories.js";
 import { TicketStore, type Ticket } from "./ticket-store.js";
 import { StatsStore, type StatsChannelEntry, type StatsChannelKind } from "./stats-store.js";
 import { TrialStore, type TrialEntry } from "./trial-store.js";
+import { checkTrialGate } from "./trial-gate.js";
+import * as portal from "./portal.js";
+import { flag, refreshFlags } from "./runtime-flags.js";
 import { SetupStore } from "./setup-store.js";
 import { buildByteflixServer } from "./byteflix-setup.js";
 import { createTrialAccount, isJfaGoConfigured, listJfaGoUsers } from "./jfago.js";
@@ -706,6 +709,7 @@ async function maybePostWeeklyReport() {
   if (last && now.getTime() - new Date(last).getTime() < 6 * 24 * 60 * 60_000) return;
 
   const entries = await trialStore.allEntries();
+  const snapshots: Array<{ guildId: string; trials: number; upgrades: number; expired: number; reactivated: number; activeAbos: number; activeTrials: number; periodEnd: string }> = [];
   for (const guild of client.guilds.cache.values()) {
     const counters = await funnelStore.getCounters(guild.id);
     const guildEntries = entries.filter((item) => item.guildId === guild.id);
@@ -725,7 +729,66 @@ async function maybePostWeeklyReport() {
       .setFooter({ text: "Zeitraum: seit dem letzten Report" })
       .setTimestamp();
     await logTrial(guild, embed);
+    snapshots.push({ guildId: guild.id, ...counters, activeAbos, activeTrials, periodEnd: now.toISOString() });
     await funnelStore.resetAfterReport(guild.id, now.toISOString());
+  }
+  // Mirror the weekly numbers to the portal so it can chart the trend over time.
+  await portal.sendFunnelSnapshots(snapshots).catch(() => undefined);
+}
+
+// Push current trial + open-ticket snapshots to the portal, poll runtime flags,
+// mirror the support status, and execute queued admin commands (trial resets).
+// All best-effort: portal outages never disturb the bot.
+async function syncWithPortal() {
+  if (!portal.portalConfigured()) return;
+  await refreshFlags();
+
+  const support = await portal.fetchSupport();
+  if (support) {
+    const current = await supportStore.get();
+    if (current.status !== support.status || current.message !== support.message) {
+      await supportStore.set(support.status, support.message, "portal").catch(() => undefined);
+    }
+  }
+
+  const trials = (await trialStore.allEntries()).map(({ guildId, entry }) => ({
+    guildId,
+    userId: entry.userId,
+    jellyfinUsername: entry.jellyfinUsername,
+    type: entry.type ?? "trial",
+    expiresAt: entry.expiresAt,
+    suspended: Boolean(entry.suspended),
+    nudgeSent: Boolean(entry.nudgeSent)
+  }));
+  await portal.sendReport("trials", { updatedAt: new Date().toISOString(), entries: trials }).catch(() => undefined);
+
+  const tickets: Array<Record<string, unknown>> = [];
+  for (const guild of client.guilds.cache.values()) {
+    for (const t of await ticketStore.listOpen(guild.id)) {
+      tickets.push({
+        guildId: guild.id, number: t.number, category: t.category, subject: t.subject,
+        priority: t.priority ?? null, priorityReason: t.priorityReason ?? null, aiSummary: t.aiSummary ?? null,
+        ownerId: t.ownerId, createdAt: t.createdAt, lastUserMessageAt: t.lastUserMessageAt ?? null
+      });
+    }
+  }
+  await portal.sendReport("tickets", { updatedAt: new Date().toISOString(), tickets }).catch(() => undefined);
+
+  for (const command of await portal.fetchCommands()) {
+    try {
+      if (command.kind === "trial_reset") {
+        const target = command.target.trim().toLowerCase();
+        const matches = (await trialStore.allEntries()).filter(({ entry }) =>
+          entry.userId.toLowerCase() === target || entry.jellyfinUsername.toLowerCase() === target
+        );
+        for (const m of matches) await trialStore.remove(m.guildId, m.entry.userId);
+        await portal.ackCommand(command.id, "done", matches.length ? `${matches.length} Eintrag/Einträge entfernt` : "kein passender Trial gefunden");
+      } else {
+        await portal.ackCommand(command.id, "failed", `unbekannter Befehl: ${command.kind}`);
+      }
+    } catch (error) {
+      await portal.ackCommand(command.id, "failed", error instanceof Error ? error.message : String(error));
+    }
   }
 }
 
@@ -1037,7 +1100,7 @@ function memberHasMemberStatus(member: GuildMember) {
 }
 
 async function handleLinkFilterMessage(message: Message) {
-  if (!config.ENABLE_LINK_FILTER || !message.guild) return false;
+  if (!flag("link_filter", config.ENABLE_LINK_FILTER) || !message.guild) return false;
   if (!messageHasBlockedLink(message.content)) return false;
   const member = await moderationMember(message);
   if (!member) return false; // team/mods are exempt
@@ -1053,7 +1116,7 @@ async function handleLinkFilterMessage(message: Message) {
 }
 
 async function handleAdvancedAntiSpamMessage(message: Message) {
-  if (!config.ENABLE_ADVANCED_ANTI_SPAM || !message.guild) return false;
+  if (!flag("advanced_anti_spam", config.ENABLE_ADVANCED_ANTI_SPAM) || !message.guild) return false;
 
   const member = await moderationMember(message);
   if (!member) return false;
@@ -1513,7 +1576,7 @@ function ticketWaitingSince(ticket: Ticket) {
 }
 
 async function checkTicketFollowUps() {
-  if (!config.ENABLE_TICKET_FOLLOWUPS) return;
+  if (!flag("ticket_followups", config.ENABLE_TICKET_FOLLOWUPS)) return;
 
   for (const guild of client.guilds.cache.values()) {
     const tickets = await ticketStore.listOpen(guild.id);
@@ -2686,12 +2749,24 @@ async function createTrialViaInteraction(interaction: ChatInputCommandInteractio
 
   await interaction.deferReply({ ephemeral: true });
 
+  // Remote switch from the payment portal's admin panel: no new trials while
+  // it is off (or while the portal cannot be reached — fail closed).
+  const gate = await checkTrialGate();
+  if (!gate.allowed) {
+    await interaction.editReply(gate.reason === "disabled"
+      ? "Die Trial-Funktion ist derzeit deaktiviert. Schau später noch einmal vorbei!"
+      : "Der Testzugang ist gerade nicht verfügbar. Bitte versuch es später erneut.");
+    return;
+  }
+
+  // The portal may override the trial duration (e.g. a promo weekend).
+  const trialHours = gate.trialHours ?? config.TRIAL_HOURS;
   const username = generateTrialUsername();
   const password = generateTrialPassword();
   const label = `discord-trial-${interaction.user.id}-${Date.now()}`;
 
   try {
-    await createTrialAccount({ username, password, trialHours: config.TRIAL_HOURS, label });
+    await createTrialAccount({ username, password, trialHours, label });
   } catch (error) {
     await logErrorToDiscord({
       guild: interaction.guild,
@@ -2703,7 +2778,7 @@ async function createTrialViaInteraction(interaction: ChatInputCommandInteractio
     return;
   }
 
-  const expiresAt = Date.now() + config.TRIAL_HOURS * 60 * 60_000;
+  const expiresAt = Date.now() + trialHours * 60 * 60_000;
   const loginBase = config.JELLYFIN_PUBLIC_URL || config.JELLYFIN_BASE_URL;
   const loginUrl = loginBase ? loginBase.replace(/\/+$/, "") : "(Jellyfin-URL)";
   const expiryTag = `<t:${Math.floor(expiresAt / 1000)}:R>`;
@@ -3191,23 +3266,37 @@ client.once(Events.ClientReady, async () => {
     void maybePostWeeklyReport().catch((error) => console.error("[report] weekly report failed", error));
   }, 60 * 60_000);
   void maybePostWeeklyReport();
+
+  // Two-way portal integration: heartbeat + flag/support/report/command sync.
+  if (portal.portalConfigured()) {
+    const heartbeat = () => void portal.sendHeartbeat().catch(() => undefined);
+    heartbeat();
+    setInterval(heartbeat, 5 * 60_000);
+    const sync = () => void syncWithPortal().catch((error) => console.error("[portal] sync failed", error));
+    sync();
+    setInterval(sync, Math.max(1, config.PORTAL_SYNC_MINUTES) * 60_000);
+    console.log(`[portal] Integration aktiv (${config.PORTAL_BASE_URL}).`);
+  }
+
   console.log(`Discord bot online as ${client.user?.tag}.`);
 });
 
 client.on(Events.GuildMemberAdd, async (member) => {
-  if (config.ENABLE_WELCOME) {
+  const memberMonitoring = flag("member_monitoring", config.ENABLE_MEMBER_MONITORING);
+  const newAccountProtection = flag("new_account_protection", config.ENABLE_NEW_ACCOUNT_PROTECTION);
+  if (flag("welcome", config.ENABLE_WELCOME)) {
     await sendWelcomeGreeting(member).catch(() => undefined);
   }
-  if (!config.ENABLE_MEMBER_MONITORING && !config.ENABLE_NEW_ACCOUNT_PROTECTION) return;
+  if (!memberMonitoring && !newAccountProtection) return;
   await store.recordJoin(member.id);
 
-  if (config.ENABLE_MEMBER_MONITORING && config.DISCORD_MEMBER_ROLE_ID) {
+  if (memberMonitoring && config.DISCORD_MEMBER_ROLE_ID) {
     await member.roles.add(config.DISCORD_MEMBER_ROLE_ID, "Auto role for new Discord member").catch(() => undefined);
   }
 
   const ageDays = accountAgeDays(member.user);
-  const newAccount = config.ENABLE_NEW_ACCOUNT_PROTECTION && ageDays < config.NEW_ACCOUNT_WARN_DAYS;
-  const strictNew = config.ENABLE_NEW_ACCOUNT_PROTECTION && ageDays < config.NEW_ACCOUNT_STRICT_DAYS;
+  const newAccount = newAccountProtection && ageDays < config.NEW_ACCOUNT_WARN_DAYS;
+  const strictNew = newAccountProtection && ageDays < config.NEW_ACCOUNT_STRICT_DAYS;
 
   if (strictNew && config.DISCORD_NEW_ACCOUNT_REVIEW_ROLE_ID) {
     await member.roles.add(config.DISCORD_NEW_ACCOUNT_REVIEW_ROLE_ID, "Sehr neuer Account: Review-Rolle").catch(() => undefined);
@@ -3235,7 +3324,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
 });
 
 client.on(Events.GuildMemberRemove, async (member) => {
-  if (!config.ENABLE_MEMBER_MONITORING) return;
+  if (!flag("member_monitoring", config.ENABLE_MEMBER_MONITORING)) return;
   await store.recordLeave(member.id);
   await logToDiscord(member.guild, new EmbedBuilder()
     .setTitle("User verlassen")
@@ -3278,7 +3367,7 @@ async function handleMessageCreate(message: Message) {
     return;
   }
 
-  if (isOpenAiAssistantReady()) {
+  if (isOpenAiAssistantReady() && flag("ai_assistant", true)) {
     await sendTypingIfPossible(message.channel);
     try {
       if (await answerWithAiAssistant({
