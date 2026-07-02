@@ -380,8 +380,10 @@ function channelNameKey(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9-]+/g, "");
 }
 
+// Payment pointer for the AI assistant context; the old shop web page is gone,
+// so this is the crypto pay link or a ticket hint.
 function paymentUrl() {
-  return `${config.PUBLIC_BASE_URL.replace(/\/+$/, "")}/pay`;
+  return config.SHOP_PAY_URL || "Kein direkter Zahlungslink - bitte ein Support-Ticket öffnen.";
 }
 
 // Public pricing/info post for /aboinfo. Content is intentionally inline so it is
@@ -2214,70 +2216,6 @@ async function registerCommands() {
 
 // Resolve a managed role by remembered ID first, then by name (caching the ID), and
 // only create it if it really does not exist - so renaming it never spawns a duplicate.
-async function ensureSetupRole(guild: Guild, key: string, name: string) {
-  const storedId = await setupStore.getId(guild.id, key);
-  if (storedId) {
-    const byId = guild.roles.cache.get(storedId) ?? await guild.roles.fetch(storedId).catch(() => null);
-    if (byId) return { created: false };
-  }
-  const byName = guild.roles.cache.find((role) => role.name.toLowerCase() === name.toLowerCase());
-  if (byName) {
-    await setupStore.setId(guild.id, key, byName.id);
-    return { created: false };
-  }
-  const role = await guild.roles.create({ name, reason: "Jellyfin Discord bot setup" });
-  await setupStore.setId(guild.id, key, role.id);
-  return { created: true };
-}
-
-async function ensureSetupTextChannel(guild: Guild, key: string, name: string, parentId: string) {
-  const storedId = await setupStore.getId(guild.id, key);
-  if (storedId) {
-    const byId = await guild.channels.fetch(storedId).catch(() => null);
-    if (byId) return { created: false };
-  }
-  const byName = guild.channels.cache.find((channel) =>
-    channel.type === ChannelType.GuildText && channel.name.toLowerCase() === name.toLowerCase()
-  );
-  if (byName) {
-    await setupStore.setId(guild.id, key, byName.id);
-    return { created: false };
-  }
-  const channel = await guild.channels.create({ name, type: ChannelType.GuildText, parent: parentId, reason: "Jellyfin Discord bot setup" });
-  await setupStore.setId(guild.id, key, channel.id);
-  return { created: true };
-}
-
-async function setupGuild(guild: Guild) {
-  const created: string[] = [];
-
-  if ((await ensureSetupRole(guild, "role:member", "Jellyfin Mitglied")).created) created.push("Rolle: Jellyfin Mitglied");
-  if ((await ensureSetupRole(guild, "role:support", "Support")).created) created.push("Rolle: Support");
-
-  const categoryStoredId = await setupStore.getId(guild.id, "category:jellyfin");
-  let category = categoryStoredId ? await guild.channels.fetch(categoryStoredId).catch(() => null) : null;
-  if (category?.type !== ChannelType.GuildCategory) {
-    const byName = guild.channels.cache.find((channel) =>
-      channel.type === ChannelType.GuildCategory && channel.name.toLowerCase() === "jellyfin"
-    );
-    if (byName?.type === ChannelType.GuildCategory) {
-      category = byName;
-    } else {
-      category = await guild.channels.create({ name: "Jellyfin", type: ChannelType.GuildCategory, reason: "Jellyfin Discord bot setup" });
-      created.push("Kategorie: Jellyfin");
-    }
-  }
-  await setupStore.setId(guild.id, "category:jellyfin", category.id);
-
-  for (const name of ["welcome", "support", "status", "payments", "mod-log"]) {
-    if ((await ensureSetupTextChannel(guild, `channel:${name}`, name, category.id)).created) {
-      created.push(`Kanal: #${name}`);
-    }
-  }
-
-  return created;
-}
-
 async function handleServerAufbauCommand(interaction: ChatInputCommandInteraction) {
   if (!interaction.guild) return;
   await interaction.deferReply({ ephemeral: true });
@@ -2873,25 +2811,6 @@ async function handleMeinAccountCommand(interaction: ChatInputCommandInteraction
   await interaction.reply({ ephemeral: true, content: lines.join("\n") });
 }
 
-async function handleWhoisCommand(interaction: ChatInputCommandInteraction) {
-  if (!interaction.guild) return;
-  if (!(await ensureCommandPermission(interaction, isModerator))) return;
-  const target = interaction.options.getUser("user", true);
-  const entry = await trialStore.get(interaction.guild.id, target.id);
-  if (!entry) {
-    await interaction.reply({ ephemeral: true, content: `${target.tag} hat keinen verknüpften Jellyfin-Account.` });
-    return;
-  }
-  await interaction.reply({
-    ephemeral: true,
-    content: [
-      `${target.tag} -> Jellyfin \`${entry.jellyfinUsername}\``,
-      `Typ: ${accountTypeLabel(entry.type)}`,
-      `Verknüpft seit: ${entry.createdAt}`
-    ].join("\n")
-  });
-}
-
 // Team lookup that shows the full Discord <-> Jellyfin link the bot logged when
 // the account was created. Resolves from either side (Discord user or Jellyfin
 // username) and cross-checks whether the account still exists on Jellyfin.
@@ -3246,11 +3165,6 @@ async function handleInteractionCreate(interaction: Interaction) {
     return;
   }
 
-  if (interaction.commandName === "payment-link") {
-    await interaction.reply({ ephemeral: true, content: `Zahlungsseite: ${paymentUrl()}` });
-    return;
-  }
-
   if (interaction.commandName === "trial") {
     await handleTrialCommand(interaction);
     return;
@@ -3258,11 +3172,6 @@ async function handleInteractionCreate(interaction: Interaction) {
 
   if (interaction.commandName === "meinaccount") {
     await handleMeinAccountCommand(interaction);
-    return;
-  }
-
-  if (interaction.commandName === "whois") {
-    await handleWhoisCommand(interaction);
     return;
   }
 
@@ -3471,12 +3380,6 @@ async function handleInteractionCreate(interaction: Interaction) {
     return;
   }
 
-  if (interaction.commandName === "setup") {
-    if (!(await ensureCommandPermission(interaction, (member) => memberHasGuildPermission(member, PermissionFlagsBits.ManageGuild)))) return;
-    await interaction.deferReply({ ephemeral: true });
-    const created = await setupGuild(interaction.guild);
-    await interaction.editReply(created.length ? `Erstellt:\n${created.join("\n")}` : "Alles war bereits vorhanden.");
-  }
 }
 
 client.on(Events.InteractionCreate, (interaction) => {

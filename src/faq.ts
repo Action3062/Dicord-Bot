@@ -8,12 +8,12 @@ export const faqItems: FaqItem[] = [
   {
     title: "Jellyfin Zugang",
     keywords: ["zugang", "account", "jellyfin", "login", "einloggen", "freischalten"],
-    answer: "Für Jellyfin brauchst du einen aktiven Benutzer. Nutze /usercheck, um deinen Namen zu prüfen, und /payment-link für die Zahlungsseite."
+    answer: "Für Jellyfin brauchst du einen aktiven Benutzer. Starte mit /trial für einen Testzugang - alle Infos zum Abo findest du in den Abo-Kanälen oder per Support-Ticket."
   },
   {
     title: "Zahlung",
     keywords: ["zahlung", "bezahlen", "crypto", "bitcoin", "azteco", "rechnung", "invoice"],
-    answer: "Zahlungen laufen über die Zahlungsseite. Nach einer bestätigten Zahlung verlaengert die API den Jellyfin-Zugang automatisch."
+    answer: "Bezahlt wird per Krypto, Azteco-Voucher oder Amazon.de-Gutschein (ab 10 Euro, nur per Support-Ticket). Nach bestätigter Zahlung wird dein Jellyfin-Zugang automatisch verlängert."
   },
   {
     title: "Support",

@@ -26,7 +26,6 @@ const schema = z.object({
   DISCORD_TICKET_CATEGORY_ID: z.string().default(""),
   DISCORD_TICKET_ARCHIVE_CATEGORY_ID: z.string().default(""),
   DISCORD_TICKET_LOG_CHANNEL_ID: z.string().default(""),
-  PUBLIC_BASE_URL: z.string().url().default("http://localhost:3000"),
   SHOP_PAY_URL: z.string().default(""),
   AZTECO_VOUCHER_URL: z.string().default("https://azte.co/"),
   JELLYFIN_BASE_URL: z.string().default(""),
@@ -69,7 +68,13 @@ const schema = z.object({
   IPV64_API_KEY: z.string().default(""),
   STATUS_CHANNEL_ID: z.string().default(""),
   STATUS_MONITORS: z.string().default("Gateway Server,Jellyfin"),
-  STATUS_REFRESH_MINUTES: z.preprocess((value) => optionalNumber(value, 30), z.number().int().positive())
+  STATUS_REFRESH_MINUTES: z.preprocess((value) => optionalNumber(value, 30), z.number().int().positive()),
+  TRIAL_NUDGE_HOURS: z.preprocess((value) => optionalNumber(value, 6), z.number().int().positive()),
+  NEW_CONTENT_CHANNEL_ID: z.string().default(""),
+  NEW_CONTENT_CHECK_MINUTES: z.preprocess((value) => optionalNumber(value, 30), z.number().int().positive()),
+  JELLYSEERR_BASE_URL: z.string().default(""),
+  JELLYSEERR_API_KEY: z.string().default(""),
+  ENABLE_WELCOME: z.preprocess((value) => boolFromEnv(value, true), z.boolean())
 });
 
 export const config = schema.parse(process.env);

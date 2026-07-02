@@ -30,9 +30,6 @@ export const commandBuilders = [
       .setAutocomplete(true)
       .setRequired(false)),
   new SlashCommandBuilder()
-    .setName("payment-link")
-    .setDescription("Sendet den Link zur Zahlungsseite."),
-  new SlashCommandBuilder()
     .setName("ask")
     .setDescription("Fragt den Jellyfin-Assistenten.")
     .addStringOption((option) => option
@@ -146,13 +143,6 @@ export const commandBuilders = [
     .setName("meinaccount")
     .setDescription("Zeigt deinen verknüpften Jellyfin-Account und Status."),
   new SlashCommandBuilder()
-    .setName("whois")
-    .setDescription("Zeigt den verknüpften Jellyfin-Account eines Users (Team).")
-    .addUserOption((option) => option
-      .setName("user")
-      .setDescription("User")
-      .setRequired(true)),
-  new SlashCommandBuilder()
     .setName("warn")
     .setDescription("Verwarnt einen User und schreibt es ins Log.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
@@ -224,10 +214,6 @@ export const commandBuilders = [
       .setName("text")
       .setDescription("Nachricht")
       .setRequired(true)),
-  new SlashCommandBuilder()
-    .setName("setup")
-    .setDescription("Erstellt Standard-Kanäle und Rollen für den Jellyfin-Discord.")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
     .setName("aboinfo")
     .setDescription("Postet einen Abo-Channel-Beitrag (Pakete / Info / Zugang).")
