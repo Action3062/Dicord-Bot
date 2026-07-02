@@ -78,6 +78,7 @@ const moderationCooldowns = new Map<string, number>();
 const TICKET_CREATE_BUTTON_ID = "ticket:create";
 const TICKET_CLOSE_BUTTON_ID = "ticket:close";
 const WUNSCH_BUTTON_PREFIX = "wunsch:";
+const TRIAL_BUTTON_ID = "trial:start";
 const TICKET_CREATE_MODAL_ID = "ticket:create-modal";
 const TICKET_MODAL_SUBJECT_ID = "ticket-subject";
 const TICKET_MODAL_DESCRIPTION_ID = "ticket-description";
@@ -492,9 +493,32 @@ function aboZugangEmbed() {
     .setFooter({ text: "Fragen? Öffne ein Support-Ticket." });
 }
 
+// 🧪 Trial channel post: fixed button that creates a trial account on click.
+function trialInfoEmbed() {
+  return new EmbedBuilder()
+    .setTitle("🧪 Byteflix kostenlos testen")
+    .setColor(0x9b59b6)
+    .setDescription([
+      "Überzeug dich selbst: Mit einem Klick bekommst du einen **kostenlosen Testzugang** zur kompletten Byteflix-Mediathek.",
+      "",
+      `⏳ **Laufzeit:** ${config.TRIAL_HOURS} Stunden`,
+      "📩 Deine Zugangsdaten kommen sofort per **DM** - bitte ändere dein Passwort nach dem ersten Login.",
+      "🔁 Pro Person gibt es einen Testzugang.",
+      "",
+      "Danach einfach weiterschauen: Abo für **10 €/Monat** oder **100 €/Jahr**."
+    ].join("\n"))
+    .setFooter({ text: "Byteflix" });
+}
+
 function aboComponents(guild: Guild, typ: string) {
   if (typ === "pakete") return aboInfoComponents(guild);
   const row = new ActionRowBuilder<ButtonBuilder>();
+  if (typ === "trial") {
+    row.addComponents(new ButtonBuilder()
+      .setCustomId(TRIAL_BUTTON_ID)
+      .setLabel("🧪 Kostenlosen Testzugang erstellen")
+      .setStyle(ButtonStyle.Success));
+  }
   if (typ === "zugang") {
     const login = loginLinkButton();
     if (login) row.addComponents(login);
@@ -801,7 +825,7 @@ async function ensureCommandPermission(
   return false;
 }
 
-async function getInteractionMember(interaction: ChatInputCommandInteraction) {
+async function getInteractionMember(interaction: ChatInputCommandInteraction | ButtonInteraction) {
   if (!interaction.guild) return null;
   if (interaction.member instanceof GuildMember) return interaction.member;
   return interaction.guild.members.fetch(interaction.user.id).catch(() => null);
@@ -2628,7 +2652,26 @@ async function logTrial(guild: Guild, embed: EmbedBuilder) {
   if (canSend(channel)) await channel.send({ embeds: [embed] }).catch(() => undefined);
 }
 
-async function handleTrialCommand(interaction: ChatInputCommandInteraction) {
+// Guards against double-clicks on the trial button (or rapid re-runs of /trial)
+// creating two jfa-go accounts before the first write lands in the store.
+const trialCreationInFlight = new Set<string>();
+
+async function handleTrialCommand(interaction: ChatInputCommandInteraction | ButtonInteraction) {
+  if (!interaction.guild) return;
+  const inFlightKey = `${interaction.guild.id}:${interaction.user.id}`;
+  if (trialCreationInFlight.has(inFlightKey)) {
+    await interaction.reply({ ephemeral: true, content: "Dein Testzugang wird gerade erstellt - einen kleinen Moment." }).catch(() => undefined);
+    return;
+  }
+  trialCreationInFlight.add(inFlightKey);
+  try {
+    await createTrialViaInteraction(interaction);
+  } finally {
+    trialCreationInFlight.delete(inFlightKey);
+  }
+}
+
+async function createTrialViaInteraction(interaction: ChatInputCommandInteraction | ButtonInteraction) {
   if (!interaction.guild) return;
   if (!isJfaGoConfigured()) {
     await interaction.reply({ ephemeral: true, content: "Der Testzugang ist gerade nicht verfügbar (jfa-go ist nicht konfiguriert)." });
@@ -3306,6 +3349,9 @@ async function handleInteractionCreate(interaction: Interaction) {
     if (interaction.customId.startsWith(WUNSCH_BUTTON_PREFIX)) {
       await handleWunschButton(interaction);
     }
+    if (interaction.customId === TRIAL_BUTTON_ID) {
+      await handleTrialCommand(interaction);
+    }
     if (interaction.customId === AI_LIBRARY_SCAN_BUTTON_ID) {
       await handleLibraryScanButton(interaction);
     }
@@ -3573,7 +3619,7 @@ async function handleInteractionCreate(interaction: Interaction) {
       await interaction.reply({ ephemeral: true, content: "Der Zielkanal muss ein Textkanal sein, in dem ich schreiben darf." });
       return;
     }
-    const embed = typ === "info" ? aboFeaturesEmbed() : typ === "zugang" ? aboZugangEmbed() : aboInfoEmbed();
+    const embed = typ === "info" ? aboFeaturesEmbed() : typ === "zugang" ? aboZugangEmbed() : typ === "trial" ? trialInfoEmbed() : aboInfoEmbed();
     await target.send({ embeds: [embed], components: aboComponents(interaction.guild, typ) });
     await interaction.reply({ ephemeral: true, content: `Abo-Beitrag (${typ}) in <#${target.id}> gepostet.` });
     return;

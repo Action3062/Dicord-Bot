@@ -258,7 +258,7 @@ export const commandBuilders = [
       .setRequired(true)),
   new SlashCommandBuilder()
     .setName("aboinfo")
-    .setDescription("Postet einen Abo-Channel-Beitrag (Pakete / Info / Zugang).")
+    .setDescription("Postet einen Abo-Channel-Beitrag (Pakete / Info / Zugang / Trial-Button).")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption((option) => option
       .setName("typ")
@@ -266,7 +266,8 @@ export const commandBuilders = [
       .addChoices(
         { name: "Pakete & Preise", value: "pakete" },
         { name: "Abo-Info", value: "info" },
-        { name: "Abo-Zugang", value: "zugang" }
+        { name: "Abo-Zugang", value: "zugang" },
+        { name: "Trial-Start (Button)", value: "trial" }
       )
       .setRequired(true))
     .addChannelOption((option) => option
